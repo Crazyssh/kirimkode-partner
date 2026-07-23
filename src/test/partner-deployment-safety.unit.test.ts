@@ -1,20 +1,25 @@
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
 import { createPartnerBackupPlan } from "../../scripts/backup-partner-db.mjs";
-import { createPartnerReleasePlan } from "../../scripts/release-partner.mjs";
+import { createPartnerReleasePlan, partnerReleaseStepEnvironment } from "../../scripts/release-partner.mjs";
+import { createPartnerRestorePlan } from "../../scripts/restore-partner-db.mjs";
 import {
   assertPartnerBackupArtifact,
   assertPartnerProcessName,
   parsePartnerDatabaseUrl,
+  parsePartnerMigrationDatabaseUrl,
   postgresEnvironment,
 } from "../../scripts/lib/partner-target-guards.mjs";
 
 const appRoot = fileURLToPath(new URL("../../", import.meta.url));
 const partnerDatabaseUrl = "postgresql://kirimkode_partner_app:secret@127.0.0.1:5432/kirimkode_partner?sslmode=require";
+const partnerMigrationDatabaseUrl = "postgresql://kirimkode_partner_migrator:secret@127.0.0.1:5432/kirimkode_partner";
 
 function deploymentFile(relativePath: string): string {
   return readFileSync(path.join(appRoot, relativePath), "utf8");
@@ -78,6 +83,30 @@ describe("Partner deployment artifacts", () => {
     expect(`${portal}\n${api}`).not.toContain("127.0.0.1:3000");
   });
 
+  it("sends hardened security headers on both Partner vhosts", () => {
+    const portal = deploymentFile("deploy/nginx/partner.kirimkode.com.conf");
+    const api = deploymentFile("deploy/nginx/partner-api.kirimkode.com.conf");
+
+    for (const conf of [portal, api]) {
+      // HSTS with a long max-age + includeSubDomains, emitted even on errors.
+      expect(conf).toMatch(
+        /add_header\s+Strict-Transport-Security\s+"max-age=\d{7,};[^"]*includeSubDomains"\s+always;/,
+      );
+      expect(conf).toMatch(/add_header\s+X-Content-Type-Options\s+"nosniff"\s+always;/);
+      expect(conf).toMatch(/add_header\s+X-Frame-Options\s+"DENY"\s+always;/);
+      expect(conf).toMatch(/add_header\s+Referrer-Policy\s+"[^"]+"\s+always;/);
+      // A CSP that forbids framing, backstopping the X-Frame-Options clickjacking gate.
+      expect(conf).toMatch(
+        /add_header\s+Content-Security-Policy\s+"[^"]*frame-ancestors 'none'[^"]*"\s+always;/,
+      );
+    }
+
+    // The portal serves a document, so it keeps a conservative same-origin
+    // default; the JSON-only API is stricter still and may load nothing at all.
+    expect(portal).toMatch(/Content-Security-Policy\s+"default-src 'self';/);
+    expect(api).toMatch(/Content-Security-Policy\s+"default-src 'none';/);
+  });
+
   it("builds, migrates, and reloads only Partner Platform", () => {
     const plan = createPartnerReleasePlan(appRoot);
     expect(plan.map(({ command, args }) => [command, ...args])).toEqual([
@@ -104,5 +133,76 @@ describe("Partner deployment artifacts", () => {
       `--file=${plan.artifact}.partial`,
     ]);
     expect(plan.args.join(" ")).not.toContain(partnerDatabaseUrl);
+  });
+});
+
+describe("Partner deployment ops safety", () => {
+  // Validates: Requirements 20.1, 22.6 — restore must not silently no-op and
+  // release migrations must run as a DDL-capable role, never the app role.
+  it("plans a restore that actually targets the Partner database via --dbname", () => {
+    const tempRoot = mkdtempSync(path.join(os.tmpdir(), "partner-restore-plan-"));
+    try {
+      const backupRoot = path.join(tempRoot, "kirimkode-partner");
+      mkdirSync(backupRoot, { recursive: true });
+      const artifact = path.join(backupRoot, "kirimkode_partner_20260101T010203Z.dump");
+      const dumpBytes = Buffer.from("partner-custom-format-dump");
+      writeFileSync(artifact, dumpBytes);
+      const sha256 = createHash("sha256").update(dumpBytes).digest("hex");
+      writeFileSync(`${artifact}.manifest.json`, JSON.stringify({ database: "kirimkode_partner", sha256 }));
+
+      const plan = createPartnerRestorePlan(artifact, {
+        PARTNER_DATABASE_URL: partnerDatabaseUrl,
+        PARTNER_BACKUP_ROOT: backupRoot,
+        PARTNER_RESTORE_CONFIRM: "kirimkode_partner",
+      });
+
+      expect(plan.command).toBe("pg_restore");
+      // Without --dbname, pg_restore prints the archive as a script to stdout and
+      // exits 0 while restoring nothing; the target DB must be named to restore.
+      const dbnameIndex = plan.args.indexOf("--dbname");
+      expect(dbnameIndex).toBeGreaterThanOrEqual(0);
+      expect(plan.args[dbnameIndex + 1]).toBe("kirimkode_partner");
+      // Every safe flag is preserved, the archive is still the final argument,
+      // and credentials never reach argv (they travel through the PG* env).
+      for (const flag of ["--clean", "--if-exists", "--single-transaction", "--exit-on-error", "--no-owner", "--no-privileges"]) {
+        expect(plan.args).toContain(flag);
+      }
+      expect(plan.args.at(-1)).toBe(artifact);
+      expect(plan.args.join(" ")).not.toContain("secret");
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("runs the release migrate step as the DDL-capable migrator role, not the app role", () => {
+    const releaseEnvironment = {
+      PARTNER_DATABASE_URL: partnerDatabaseUrl,
+      PARTNER_MIGRATION_DATABASE_URL: partnerMigrationDatabaseUrl,
+    };
+    const plan = createPartnerReleasePlan(appRoot);
+    const migrateStep = plan.find((step) => step.args.includes("migrate"));
+    const reloadStep = plan.find((step) => step.command === "pm2");
+    if (!migrateStep || !reloadStep) throw new Error("expected migrate and reload steps");
+
+    // The migrate step swaps the datasource to the migrator URL so Prisma can run
+    // DDL; the CREATE-revoked app-role URL is never used for migrations.
+    const migrateEnvironment = partnerReleaseStepEnvironment(migrateStep, releaseEnvironment);
+    expect(migrateEnvironment.PARTNER_DATABASE_URL).toBe(partnerMigrationDatabaseUrl);
+    expect(migrateEnvironment.PARTNER_DATABASE_URL).not.toBe(partnerDatabaseUrl);
+
+    // Every other step (build, reload, ...) keeps running as the runtime app role.
+    expect(partnerReleaseStepEnvironment(reloadStep, releaseEnvironment).PARTNER_DATABASE_URL).toBe(partnerDatabaseUrl);
+
+    // The migration URL is guarded: the production Partner DB with a migrator/owner
+    // role only, and it refuses the app role (which cannot run DDL) outright.
+    expect(parsePartnerMigrationDatabaseUrl(partnerMigrationDatabaseUrl).username).toBe("kirimkode_partner_migrator");
+    expect(() => parsePartnerMigrationDatabaseUrl("postgresql://kirimkode_partner_app:secret@127.0.0.1:5432/kirimkode_partner"))
+      .toThrow("migration role");
+    expect(() => parsePartnerMigrationDatabaseUrl("postgresql://kirimkode_partner_migrator:secret@127.0.0.1:5432/kirimkode"))
+      .toThrow("database target other than kirimkode_partner");
+    expect(() => partnerReleaseStepEnvironment(migrateStep, {
+      ...releaseEnvironment,
+      PARTNER_MIGRATION_DATABASE_URL: partnerDatabaseUrl,
+    })).toThrow("migration role");
   });
 });

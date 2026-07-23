@@ -465,6 +465,50 @@ describe("PayoutReviewService", () => {
     expect(earnings.get(EARNING_1)?.status).toBe("requested");
   });
 
+  it("is idempotent: re-marking a paid payout with the same reference succeeds without a second effect", async () => {
+    const earnings = lockedEarnings();
+    const ledger = new FakeLedger();
+    const store = makeStore(
+      payoutRecord("paid", { paymentReference: "BCA-REF-001" }),
+    );
+    const service = makeService(earnings, ledger, store);
+
+    const result = await service.markPaid({
+      admin: admin(),
+      payoutId: PAYOUT_ID,
+      requestId: REQUEST_ID,
+      paymentReference: "  BCA-REF-001  ",
+    });
+
+    expect(result).toEqual({ ok: true, status: "paid" });
+    // The retry short-circuits before the transaction: no second ledger event
+    // and no new transition row.
+    expect(ledger.appended).toHaveLength(0);
+    expect(store.transitions).toHaveLength(0);
+  });
+
+  it("flags a markPaid retry on a paid payout with a different reference as a conflict", async () => {
+    const earnings = lockedEarnings();
+    const ledger = new FakeLedger();
+    const store = makeStore(
+      payoutRecord("paid", { paymentReference: "BCA-REF-001" }),
+    );
+    const service = makeService(earnings, ledger, store);
+
+    const result = await service.markPaid({
+      admin: admin(),
+      payoutId: PAYOUT_ID,
+      requestId: REQUEST_ID,
+      paymentReference: "BCA-REF-002",
+    });
+
+    // A possible second bank transfer under a new reference must not be masked
+    // as an idempotent success; no ledger effect is applied.
+    expect(result).toEqual({ ok: false, reason: "payment_reference_conflict" });
+    expect(ledger.appended).toHaveLength(0);
+    expect(store.transitions).toHaveLength(0);
+  });
+
   it("reports not_found for an absent payout", async () => {
     const earnings = lockedEarnings();
     const ledger = new FakeLedger();

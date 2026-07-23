@@ -94,6 +94,7 @@ export { PrismaRetentionGateway } from "./retention-gateway";
 export { PrismaReconciliationGateway } from "./reconciliation-gateway";
 export { PrismaPayoutDestinationGateway } from "./payout-destination-gateway";
 export { PrismaPayoutRequestGateway } from "./payout-request-gateway";
+export { PrismaPayoutMinimumReader } from "./payout-minimum-reader";
 export { PrismaPayoutReviewGateway } from "./payout-review-gateway";
 export {
   PrismaIdempotencyStore,

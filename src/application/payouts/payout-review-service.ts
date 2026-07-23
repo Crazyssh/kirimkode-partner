@@ -98,6 +98,7 @@ export type PayoutReviewOutcome =
   | { readonly ok: false; readonly reason: "terminal_state_conflict" }
   | { readonly ok: false; readonly reason: "missing_reason" }
   | { readonly ok: false; readonly reason: "missing_payment_reference" }
+  | { readonly ok: false; readonly reason: "payment_reference_conflict" }
   | { readonly ok: false; readonly reason: "duplicate_payment_reference" }
   | { readonly ok: false; readonly reason: "conflict" }
   | { readonly ok: false; readonly reason: "validation"; readonly code: string };
@@ -237,6 +238,11 @@ export class PayoutReviewService<Tx> {
           return { ok: false, reason: "missing_reason" };
         case "missing_payment_reference":
           return { ok: false, reason: "missing_payment_reference" };
+        case "payment_reference_conflict":
+          // A markPaid retry on an already-paid payout with a different
+          // reference: surfaced explicitly so a possible second bank transfer
+          // is never masked as an idempotent success (requirement 14.4).
+          return { ok: false, reason: "payment_reference_conflict" };
         case "invalid_timestamp":
           return { ok: false, reason: "validation", code: "INVALID_TIMESTAMP" };
       }

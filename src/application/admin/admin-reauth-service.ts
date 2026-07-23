@@ -12,9 +12,18 @@
  * The in-memory {@link InMemoryReauthRegistry} keeps freshness per admin without
  * adding a session column, mirroring the in-memory rate limiter already used by
  * the auth module. A process restart simply requires the admin to re-authenticate.
+ *
+ * Because the raw-SMS gate is the most sensitive admin capability, the re-auth
+ * step is itself rate-limited per admin (same fixed-window policy as admin login)
+ * so a stolen admin session cannot be used to brute-force the password: each
+ * failed attempt increments the counter and a success clears it. While in the
+ * cooldown even a correct password is refused with `rate_limited`.
  */
 import { canAdminLogin } from "@domain/task-7-5";
 
+import type { AuthRateLimiter } from "@application/auth/auth-rate-limiter";
+
+import { ADMIN_REAUTH_RATE_LIMIT, adminReauthRateLimitKey } from "./admin-config";
 import type { AdminIdentityGateway, AdminPasswordHasher, Clock } from "./ports";
 import type { ReauthRegistry } from "./raw-sms-ports";
 
@@ -25,12 +34,14 @@ export interface AdminReauthInput {
 
 export type AdminReauthOutcome =
   | { readonly ok: true; readonly reauthenticatedAtEpochMs: number }
-  | { readonly ok: false };
+  | { readonly ok: false; readonly reason: "invalid_credentials" }
+  | { readonly ok: false; readonly reason: "rate_limited"; readonly retryAfterMs: number };
 
 export interface AdminReauthServiceDeps {
   readonly identity: AdminIdentityGateway;
   readonly passwordHasher: AdminPasswordHasher;
   readonly registry: ReauthRegistry;
+  readonly rateLimiter: AuthRateLimiter;
   readonly clock: Clock;
 }
 
@@ -42,6 +53,15 @@ export class AdminReauthService {
   }
 
   async reauthenticate(input: AdminReauthInput): Promise<AdminReauthOutcome> {
+    const key = adminReauthRateLimitKey(input.adminId);
+
+    // Refuse before verifying while the admin is locked out, so a stolen session
+    // cannot brute-force the password. A denial does not extend the block.
+    const gate = await this.deps.rateLimiter.check(key, ADMIN_REAUTH_RATE_LIMIT);
+    if (!gate.allowed) {
+      return { ok: false, reason: "rate_limited", retryAfterMs: gate.retryAfterMs };
+    }
+
     const admin = await this.deps.identity.findAdminById(input.adminId);
     // Always verify (against a decoy when absent) so timing does not reveal
     // whether the id resolves — even though the session already authenticated it.
@@ -52,8 +72,11 @@ export class AdminReauthService {
     );
 
     if (admin === null || !passwordMatches || !canAdminLogin(admin.status)) {
-      return { ok: false };
+      await this.deps.rateLimiter.penalize(key, ADMIN_REAUTH_RATE_LIMIT);
+      return { ok: false, reason: "invalid_credentials" };
     }
+
+    await this.deps.rateLimiter.clear(key);
 
     const now = this.deps.clock.nowEpochMs();
     this.deps.registry.record(input.adminId, now);

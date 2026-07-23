@@ -47,6 +47,7 @@ import {
   EarningAlreadyAllocatedError,
   type Clock,
   type IdGenerator,
+  type PayoutMinimumReader,
   type PayoutRequestRepository,
   type PayoutSecretCipher,
   type PayoutTransactionRunner,
@@ -83,8 +84,13 @@ export interface PayoutRequestServiceDeps<Tx> {
   readonly cipher: PayoutSecretCipher;
   readonly clock: Clock;
   readonly idGenerator: IdGenerator;
-  /** Minimum payout in IDR; defaults to the domain minimum (Rp1.000). */
-  readonly minimumPayoutIdr?: number;
+  /**
+   * Reads the admin-editable minimum payout from the active platform config at
+   * request time. Required so the composition root can never wire a service that
+   * silently ignores the configured floor; when the reader returns `null` (no
+   * active config) the request falls back to the domain minimum (Rp1.000).
+   */
+  readonly minimum: PayoutMinimumReader;
 }
 
 /** Internal sentinel used to roll the transaction back on a lost Earning lock. */
@@ -161,10 +167,15 @@ export class PayoutRequestService<Tx> {
       earningStates.push(toEarningState(projection));
     }
 
+    // The enforced floor is the admin-editable minimum from the active platform
+    // config, read per request (an admin can change it at any time). A `null`
+    // reading (no active config) falls back to the domain minimum rather than
+    // letting a payout through with no floor.
+    const configuredMinimumIdr = await this.deps.minimum.readMinimumPayoutIdr();
     const decision = decideRequestPayout({
       payoutId,
       earnings: earningStates,
-      minimumIdr: this.deps.minimumPayoutIdr,
+      minimumIdr: configuredMinimumIdr ?? undefined,
     });
     if (decision.kind === "reject") {
       return { ok: false, reason: decision.code };

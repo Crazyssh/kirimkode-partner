@@ -15,7 +15,7 @@ import {
 import { DEFAULT_PARTNER_BACKUP_ROOT } from "./backup-partner-db.mjs";
 
 export function createPartnerRestorePlan(artifactValue, environment = process.env) {
-  parsePartnerDatabaseUrl(environment.PARTNER_DATABASE_URL || "");
+  const { databaseName } = parsePartnerDatabaseUrl(environment.PARTNER_DATABASE_URL || "");
   assertRestoreConfirmation(environment.PARTNER_RESTORE_CONFIRM);
   const backupRoot = assertPartnerBackupRoot(environment.PARTNER_BACKUP_ROOT || DEFAULT_PARTNER_BACKUP_ROOT);
   const artifact = assertPartnerBackupArtifact(artifactValue || "", backupRoot);
@@ -28,7 +28,12 @@ export function createPartnerRestorePlan(artifactValue, environment = process.en
   return {
     artifact,
     command: "pg_restore",
-    args: ["--exit-on-error", "--single-transaction", "--clean", "--if-exists", "--no-owner", "--no-privileges", artifact],
+    // Without --dbname, pg_restore emits the archive as a SQL script to stdout
+    // and exits 0 without touching any database — a silent no-op. Naming the
+    // target database makes pg_restore connect (via the PG* environment set by
+    // postgresEnvironment) and actually restore. The database name, not the
+    // full URL, is passed so credentials never appear in argv.
+    args: ["--dbname", databaseName, "--exit-on-error", "--single-transaction", "--clean", "--if-exists", "--no-owner", "--no-privileges", artifact],
   };
 }
 

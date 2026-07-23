@@ -243,6 +243,20 @@ export interface PayoutTransactionRunner<Tx> {
   run<T>(work: (tx: Tx) => Promise<T>): Promise<T>;
 }
 
+/**
+ * Reads the admin-editable minimum payout (whole IDR) from the active platform
+ * config (requirement 8.5). Read fresh on every request, never cached in the
+ * service, because a Partner Admin can publish a new config at any time (a new
+ * active version is inserted; an existing row is never mutated in place), and
+ * the portal already advertises this same figure as the enforced floor
+ * (`OperationalQueryService.payouts.minimumPayoutIdr`). Returns `null` when no
+ * active config exists so the request falls back to the domain minimum
+ * (`PAYOUT_MINIMUM_IDR`) rather than letting a payout through with no floor.
+ */
+export interface PayoutMinimumReader {
+  readMinimumPayoutIdr(): Promise<number | null>;
+}
+
 // ---------------------------------------------------------------------------
 // Payout admin review + settlement (task 14.4)
 // ---------------------------------------------------------------------------

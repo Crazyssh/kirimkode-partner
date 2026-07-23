@@ -7,6 +7,7 @@ import {
   assertPartnerAppRoot,
   assertPartnerProcessName,
   parsePartnerDatabaseUrl,
+  parsePartnerMigrationDatabaseUrl,
   PARTNER_PROCESS_NAME,
 } from "./lib/partner-target-guards.mjs";
 
@@ -18,17 +19,29 @@ export function createPartnerReleasePlan(appRoot = scriptRoot) {
   return [
     { command: "npm", args: ["ci"], cwd: root },
     { command: "npm", args: ["run", "build"], cwd: root },
-    { command: "npm", args: ["exec", "--", "prisma", "migrate", "deploy", "--schema", "prisma/schema.prisma"], cwd: root },
+    // Prisma reads its datasource from PARTNER_DATABASE_URL. This DDL step is
+    // flagged so it runs as the migrator/owner role (allowed to CREATE) rather
+    // than the CREATE-revoked runtime app role that every other step uses.
+    { command: "npm", args: ["exec", "--", "prisma", "migrate", "deploy", "--schema", "prisma/schema.prisma"], cwd: root, migration: true },
     { command: "pm2", args: ["reload", processName, "--update-env"], cwd: root },
   ];
 }
 
-function execute(step, dryRun) {
+// Every release step runs as the runtime app role except the Prisma migrate
+// step: it must connect as the DDL-capable migrator role, supplied separately
+// via PARTNER_MIGRATION_DATABASE_URL, so DDL migrations are not rejected.
+export function partnerReleaseStepEnvironment(step, environment) {
+  if (!step.migration) return environment;
+  const { value } = parsePartnerMigrationDatabaseUrl(environment.PARTNER_MIGRATION_DATABASE_URL || "");
+  return { ...environment, PARTNER_DATABASE_URL: value };
+}
+
+function execute(step, dryRun, environment) {
   console.log(`Partner release: ${step.command} ${step.args.join(" ")}`);
   if (dryRun) return;
   const result = spawnSync(step.command, step.args, {
     cwd: step.cwd,
-    env: process.env,
+    env: environment,
     shell: false,
     stdio: "inherit",
   });
@@ -39,8 +52,10 @@ function execute(step, dryRun) {
 export function runPartnerRelease(environment = process.env) {
   const root = assertPartnerAppRoot(environment.PARTNER_APP_ROOT || scriptRoot);
   parsePartnerDatabaseUrl(environment.PARTNER_DATABASE_URL || "");
+  parsePartnerMigrationDatabaseUrl(environment.PARTNER_MIGRATION_DATABASE_URL || "");
+  const dryRun = environment.PARTNER_RELEASE_DRY_RUN === "1";
   for (const step of createPartnerReleasePlan(root)) {
-    execute(step, environment.PARTNER_RELEASE_DRY_RUN === "1");
+    execute(step, dryRun, partnerReleaseStepEnvironment(step, environment));
   }
 }
 

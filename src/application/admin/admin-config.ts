@@ -21,6 +21,23 @@ export function adminLoginRateLimitKey(emailNormalized: string, ip: string): str
   return `admin-login:${emailNormalized}|${ip}`;
 }
 
+/**
+ * Step-up re-auth failure limit for the raw-SMS gate: 5 failed attempts / 15 min
+ * per admin, then a 15 min cooldown. The session already proves who the admin is,
+ * so this keys on the admin id alone. It blunts password brute-forcing from a
+ * stolen admin session (a failed re-auth increments; a success clears it), using
+ * the same fixed-window policy as admin login under a distinct key namespace.
+ */
+export const ADMIN_REAUTH_RATE_LIMIT: WindowRule = Object.freeze({
+  limit: 5,
+  windowMs: 15 * MINUTE_MS,
+  cooldownMs: 15 * MINUTE_MS,
+});
+
+export function adminReauthRateLimitKey(adminId: string): string {
+  return `admin-reauth:${adminId}`;
+}
+
 /** Build the admin session TTL policy from runtime config's second-based values. */
 export function adminSessionTtlFromSeconds(
   idleTtlSeconds: number,

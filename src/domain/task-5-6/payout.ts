@@ -245,6 +245,7 @@ export type PayoutTransitionDecision =
         | "terminal_state_conflict"
         | "missing_reason"
         | "missing_payment_reference"
+        | "payment_reference_conflict"
         | "invalid_timestamp";
     };
 
@@ -266,6 +267,19 @@ export function decidePayoutTransition(
   const target = targetStatus(command);
 
   if (payout.status === target) {
+    // A markPaid retry on an already-paid payout is only an idempotent no-op
+    // when it carries the SAME payment reference. A different reference means a
+    // second bank transfer under a new reference, which must be surfaced as a
+    // conflict rather than swallowed as success (double-transfer detection).
+    if (command.type === "markPaid") {
+      const incomingReference = command.paymentReference.trim();
+      if (incomingReference.length === 0) {
+        return { kind: "reject", code: "missing_payment_reference" };
+      }
+      if (payout.paymentReference !== incomingReference) {
+        return { kind: "reject", code: "payment_reference_conflict" };
+      }
+    }
     return {
       kind: "no_change",
       reason: "already_in_target_state",

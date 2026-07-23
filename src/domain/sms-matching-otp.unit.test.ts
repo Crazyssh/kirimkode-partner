@@ -145,6 +145,33 @@ describe("Task 5.4 WhatsApp OTP parser", () => {
       status: "rejected", reason: "decoy_candidate",
     });
   });
+  it("does not treat a word that merely contains a decoy label as a decoy", () => {
+    // `iPhone` ends with `phone`, `update` with `date`, `hotel` with `tel`;
+    // none is a standalone phone/date label, so the adjacent OTP is delivered.
+    expect(parseServiceOtp("wa", "Kode iPhone 123456")).toEqual({
+      status: "matched", otp: "123456",
+    });
+    expect(parseServiceOtp("wa", "Kode iPhone: 123456")).toEqual({
+      status: "matched", otp: "123456",
+    });
+    expect(parseServiceOtp("wa", "Kode hotel 123456")).toEqual({
+      status: "matched", otp: "123456",
+    });
+    expect(parseServiceOtp("wa", "WhatsApp update code: 123456")).toEqual({
+      status: "matched", otp: "123456",
+    });
+  });
+
+  it("still rejects a standalone phone/date label immediately before the sole candidate", () => {
+    // A genuine whole-word label adjacent to the only candidate is still a decoy.
+    expect(parseServiceOtp("wa", "WhatsApp verification phone 123456")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+    expect(parseServiceOtp("wa", "WhatsApp verification tel: 123456")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+  });
+
   it("rejects multiple candidates even when they repeat the same value", () => {
     expect(parseServiceOtp("wa", "WhatsApp code 123456, backup 654321")).toEqual({
       status: "rejected", reason: "ambiguous_candidates",

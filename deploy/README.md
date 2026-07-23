@@ -14,6 +14,8 @@ All paths and targets here are owned only by Partner Platform.
 
 Export `PARTNER_DATABASE_URL` with database `kirimkode_partner` and a role named `kirimkode_partner_app`, `kirimkode_partner_backup`, or `kirimkode_partner_restore`.
 
+Release also requires `PARTNER_MIGRATION_DATABASE_URL` with the same `kirimkode_partner` database but a DDL-capable role named `kirimkode_partner_migrator` or `kirimkode_partner_owner`. The runtime app role has `CREATE` revoked, so only the `prisma migrate deploy` step switches to this migrator URL; the server keeps running as `kirimkode_partner_app`.
+
 - Release: `node scripts/release-partner.mjs`
 - Backup: `node scripts/backup-partner-db.mjs`
 - Restore: `PARTNER_RESTORE_CONFIRM=kirimkode_partner node scripts/restore-partner-db.mjs /var/backups/kirimkode-partner/<partner-dump>.dump`

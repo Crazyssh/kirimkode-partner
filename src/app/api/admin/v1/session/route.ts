@@ -8,6 +8,7 @@
  * delegates all behaviour to the admin application services.
  */
 import { getAdminServices, ADMIN_SESSION_COOKIE_NAME } from "@application/admin";
+import { resolveClientIp } from "@application/http/client-ip";
 
 export const dynamic = "force-dynamic";
 
@@ -24,15 +25,6 @@ function readCookie(request: Request, name: string): string | null {
   return null;
 }
 
-function clientIp(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
-  return request.headers.get("x-real-ip")?.trim() ?? "unknown";
-}
-
 export async function POST(request: Request): Promise<Response> {
   let body: unknown;
   try {
@@ -47,10 +39,11 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: { code: "INVALID_BODY" } }, { status: 400 });
   }
 
-  const result = await getAdminServices().login.login({
+  const adminServices = getAdminServices();
+  const result = await adminServices.login.login({
     email,
     password,
-    ip: clientIp(request),
+    ip: resolveClientIp(request.headers, adminServices.trustedProxies),
   });
 
   if (!result.ok) {

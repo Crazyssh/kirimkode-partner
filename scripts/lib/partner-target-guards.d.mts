@@ -9,9 +9,19 @@ export interface ParsedPartnerDatabaseUrl {
   username: string;
 }
 
+export interface ParsedPartnerMigrationDatabaseUrl {
+  databaseName: "kirimkode_partner";
+  url: URL;
+  username: string;
+  value: string;
+}
+
 export function assertPartnerProcessName(value: string): "kirimkode-partner";
 export function assertPartnerAppRoot(value: string): string;
 export function parsePartnerDatabaseUrl(value: string): ParsedPartnerDatabaseUrl;
+export function parsePartnerMigrationDatabaseUrl(
+  value: string,
+): ParsedPartnerMigrationDatabaseUrl;
 export function postgresEnvironment(
   databaseUrl: string,
   baseEnvironment?: Record<string, string | undefined>,

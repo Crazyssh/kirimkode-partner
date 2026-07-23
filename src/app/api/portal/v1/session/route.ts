@@ -8,6 +8,7 @@
  * application services (task 7.2); the login outcome is enumeration-safe.
  */
 import { getAuthServices, SESSION_COOKIE_NAME } from "@application/auth";
+import { resolveClientIp } from "@application/http/client-ip";
 
 export const dynamic = "force-dynamic";
 
@@ -24,15 +25,6 @@ function readCookie(request: Request, name: string): string | null {
   return null;
 }
 
-function clientIp(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
-  return request.headers.get("x-real-ip")?.trim() ?? "unknown";
-}
-
 export async function POST(request: Request): Promise<Response> {
   let body: unknown;
   try {
@@ -47,10 +39,11 @@ export async function POST(request: Request): Promise<Response> {
     return Response.json({ error: { code: "INVALID_BODY" } }, { status: 400 });
   }
 
-  const result = await getAuthServices().login.login({
+  const authServices = getAuthServices();
+  const result = await authServices.login.login({
     email,
     password,
-    ip: clientIp(request),
+    ip: resolveClientIp(request.headers, authServices.trustedProxies),
   });
 
   if (!result.ok) {

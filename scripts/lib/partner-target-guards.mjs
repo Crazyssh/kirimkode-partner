@@ -49,6 +49,30 @@ export function parsePartnerDatabaseUrl(value) {
   return { databaseName, url, username };
 }
 
+export function parsePartnerMigrationDatabaseUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Refusing invalid PARTNER_MIGRATION_DATABASE_URL");
+  }
+  if (!["postgres:", "postgresql:"].includes(url.protocol)) {
+    throw new Error("Refusing non-PostgreSQL PARTNER_MIGRATION_DATABASE_URL");
+  }
+  const databaseName = decodeURIComponent(url.pathname.replace(/^\//, ""));
+  if (databaseName !== PARTNER_DATABASE_NAME) {
+    throw new Error(`Refusing database target other than ${PARTNER_DATABASE_NAME}`);
+  }
+  const username = decodeURIComponent(url.username);
+  // The runtime app role has CREATE revoked (see prisma/admin/partner-role-grants
+  // .sql.template), so it can never run DDL migrations. Release migrations must
+  // connect as a dedicated DDL-capable migrator/owner role instead.
+  if (!/^kirimkode_partner_(?:migrator|owner)$/.test(username)) {
+    throw new Error("Refusing migration role that cannot run Partner DDL");
+  }
+  return { databaseName, url, username, value };
+}
+
 export function postgresEnvironment(databaseUrl, baseEnvironment = process.env) {
   const { url } = parsePartnerDatabaseUrl(databaseUrl);
   const environment = {

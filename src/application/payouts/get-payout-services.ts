@@ -23,6 +23,7 @@ import {
 } from "@infrastructure/database";
 import { PrismaPayoutDestinationGateway } from "@infrastructure/database/payout-destination-gateway";
 import { PrismaPayoutRequestGateway } from "@infrastructure/database/payout-request-gateway";
+import { PrismaPayoutMinimumReader } from "@infrastructure/database/payout-minimum-reader";
 import { PrismaPayoutReviewGateway } from "@infrastructure/database/payout-review-gateway";
 import { createSmsOtpCipher } from "@infrastructure/crypto/sms-otp-cipher";
 import { CryptoIdGenerator, SystemClock } from "@infrastructure/auth/system-clock";
@@ -62,6 +63,9 @@ export function getPayoutServices(): PayoutServices {
         ledger: new PrismaLedgerRepository(client),
         earnings: new PrismaEarningProjectionRepository(client),
         payouts: new PrismaPayoutRequestGateway(client),
+        // Enforce the admin-editable minimum payout (PlatformConfig), read
+        // per request so a published config change takes effect immediately.
+        minimum: new PrismaPayoutMinimumReader(client),
         cipher,
         clock,
         idGenerator,

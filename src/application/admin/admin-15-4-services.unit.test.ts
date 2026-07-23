@@ -8,6 +8,10 @@ import { describe, expect, it } from "vitest";
 
 import type { AuthenticatedAdmin } from "@domain/task-7-5";
 
+import { AuthRateLimiter } from "@application/auth/auth-rate-limiter";
+import { InMemoryRateLimitStore } from "@infrastructure/auth/in-memory-rate-limit-store";
+
+import { ADMIN_REAUTH_RATE_LIMIT } from "./admin-config";
 import { AdminConfigService } from "./admin-config-service";
 import type {
   ActivePlatformConfigRow,
@@ -294,30 +298,89 @@ const ADMIN_RECORD: AdminAuthRecord = {
 };
 
 describe("AdminReauthService", () => {
-  it("records a re-auth on the correct password", async () => {
+  const REAUTH_LIMIT = ADMIN_REAUTH_RATE_LIMIT.limit;
+
+  /** A service wired to a real fixed-window limiter over a mutable clock. */
+  function makeReauthService() {
+    let now = NOW;
+    const mutableClock = {
+      nowEpochMs: () => now,
+      advance: (ms: number) => {
+        now += ms;
+      },
+    };
     const registry = new InMemoryReauthRegistry();
+    const rateLimiter = new AuthRateLimiter(
+      new InMemoryRateLimitStore(() => mutableClock.nowEpochMs()),
+      mutableClock,
+    );
     const service = new AdminReauthService({
       identity: new FakeIdentity(ADMIN_RECORD),
       passwordHasher: HASHER,
       registry,
-      clock,
+      rateLimiter,
+      clock: mutableClock,
     });
+    return { service, registry, clock: mutableClock };
+  }
+
+  it("records a re-auth on the correct password", async () => {
+    const { service, registry } = makeReauthService();
     const outcome = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "secret" });
     expect(outcome).toEqual({ ok: true, reauthenticatedAtEpochMs: NOW });
     expect(registry.getLastReauthEpochMs(ADMIN_RECORD.adminId)).toBe(NOW);
   });
 
   it("fails and records nothing on a wrong password", async () => {
-    const registry = new InMemoryReauthRegistry();
-    const service = new AdminReauthService({
-      identity: new FakeIdentity(ADMIN_RECORD),
-      passwordHasher: HASHER,
-      registry,
-      clock,
-    });
+    const { service, registry } = makeReauthService();
     const outcome = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "wrong" });
-    expect(outcome).toEqual({ ok: false });
+    expect(outcome).toEqual({ ok: false, reason: "invalid_credentials" });
     expect(registry.getLastReauthEpochMs(ADMIN_RECORD.adminId)).toBeNull();
+  });
+
+  it("locks out with rate_limited after too many failures, refusing even the correct password", async () => {
+    const { service, registry } = makeReauthService();
+    for (let attempt = 0; attempt < REAUTH_LIMIT; attempt += 1) {
+      const failed = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "wrong" });
+      expect(failed).toEqual({ ok: false, reason: "invalid_credentials" });
+    }
+    // Within the cooldown the correct password is still refused — brute force is blunted.
+    const blocked = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "secret" });
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) {
+      expect(blocked.reason).toBe("rate_limited");
+      if (blocked.reason === "rate_limited") {
+        expect(blocked.retryAfterMs).toBeGreaterThan(0);
+      }
+    }
+    // No re-auth was recorded while locked out, so the raw-SMS gate stays closed.
+    expect(registry.getLastReauthEpochMs(ADMIN_RECORD.adminId)).toBeNull();
+  });
+
+  it("clears the failure counter after a successful re-auth", async () => {
+    const { service } = makeReauthService();
+    for (let attempt = 0; attempt < REAUTH_LIMIT - 1; attempt += 1) {
+      await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "wrong" });
+    }
+    // A success within the window clears the accumulated failures...
+    const ok = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "secret" });
+    expect(ok.ok).toBe(true);
+    // ...so a later wrong attempt is a plain failure, not an immediate lockout.
+    const again = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "wrong" });
+    expect(again).toEqual({ ok: false, reason: "invalid_credentials" });
+  });
+
+  it("permits a fresh attempt once the cooldown window has elapsed", async () => {
+    const { service, clock: mutableClock } = makeReauthService();
+    for (let attempt = 0; attempt < REAUTH_LIMIT; attempt += 1) {
+      await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "wrong" });
+    }
+    const blocked = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "secret" });
+    expect(blocked.ok).toBe(false);
+    // Advance past the 15-minute cooldown; the counter resets and the reveal reopens.
+    mutableClock.advance(16 * 60 * 1000);
+    const outcome = await service.reauthenticate({ adminId: ADMIN_RECORD.adminId, password: "secret" });
+    expect(outcome).toEqual({ ok: true, reauthenticatedAtEpochMs: NOW + 16 * 60 * 1000 });
   });
 });
 

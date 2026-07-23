@@ -313,6 +313,40 @@ describe("payout state machine", () => {
     });
   });
 
+  it("treats a markPaid retry with the same reference as an idempotent no-op", () => {
+    const decision = decidePayoutTransition(
+      payout({ status: "paid", paymentReference: "TRX-123" }),
+      {
+        type: "markPaid",
+        paymentReference: "  TRX-123  ",
+        paidAt: new Date("2025-01-02T00:00:00.000Z"),
+        actorRef: "admin-1",
+      },
+    );
+    expect(decision).toMatchObject({
+      kind: "no_change",
+      nextStatus: "paid",
+    });
+  });
+
+  it("flags a markPaid retry on a paid payout that carries a different reference", () => {
+    // A second bank transfer under a NEW reference must never be swallowed as a
+    // silent success; it surfaces as a conflict the service can map explicitly.
+    const decision = decidePayoutTransition(
+      payout({ status: "paid", paymentReference: "TRX-123" }),
+      {
+        type: "markPaid",
+        paymentReference: "TRX-999",
+        paidAt: new Date("2025-01-02T00:00:00.000Z"),
+        actorRef: "admin-1",
+      },
+    );
+    expect(decision).toMatchObject({
+      kind: "reject",
+      code: "payment_reference_conflict",
+    });
+  });
+
   it("unlocks earnings back to available on reject with reason", () => {
     const decision = decidePayoutTransition(payout(), {
       type: "reject",

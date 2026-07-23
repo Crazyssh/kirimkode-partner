@@ -38,6 +38,11 @@ export interface AuthServices {
   readonly verifyEmail: VerifyEmailService;
   readonly requestPasswordReset: RequestPasswordResetService;
   readonly resetPassword: ResetPasswordService;
+  /**
+   * Configured trusted proxies, exposed so the transport layer can resolve the
+   * real client IP without touching config parsing or the Prisma client.
+   */
+  readonly trustedProxies: readonly string[];
 }
 
 let singleton: AuthServices | undefined;
@@ -116,6 +121,7 @@ export function getAuthServices(): AuthServices {
         passwordHasher,
         clock,
       }),
+      trustedProxies: config.trustedProxies,
     });
   }
   return singleton;

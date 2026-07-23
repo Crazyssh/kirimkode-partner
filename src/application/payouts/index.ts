@@ -39,6 +39,7 @@ export {
   type PayoutDestinationRecord,
   type PayoutDestinationTransaction,
   type PayoutDestinationView,
+  type PayoutMinimumReader,
   type PayoutRequestRepository,
   type PayoutSecretCipher,
   type PayoutTransactionRunner,

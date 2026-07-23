@@ -68,6 +68,11 @@ export interface AdminServices {
    * target partnerId at the transport edge.
    */
   readonly operational: OperationalQueryService;
+  /**
+   * Configured trusted proxies, exposed so the transport layer can resolve the
+   * real client IP without touching config parsing or the Prisma client.
+   */
+  readonly trustedProxies: readonly string[];
 }
 
 let singleton: AdminServices | undefined;
@@ -152,6 +157,7 @@ export function getAdminServices(): AdminServices {
         identity,
         passwordHasher,
         registry: reauthRegistry,
+        rateLimiter,
         clock,
       }),
       rawSms: new AdminRawSmsService({
@@ -163,6 +169,7 @@ export function getAdminServices(): AdminServices {
         idGenerator,
       }),
       operational,
+      trustedProxies: config.trustedProxies,
     });
   }
   return singleton;

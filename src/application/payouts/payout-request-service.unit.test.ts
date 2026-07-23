@@ -22,6 +22,7 @@ import {
   type NewPartnerPayout,
   type NewPayoutTransition,
   type PayoutDestinationRecord,
+  type PayoutMinimumReader,
   type PayoutRequestRepository,
   type PayoutSecretCipher,
 } from "./ports";
@@ -170,11 +171,30 @@ function context(over: Partial<AuthenticatedPrincipal> = {}): SessionContext {
   return toSessionContext(principal(over));
 }
 
+/**
+ * A fake {@link PayoutMinimumReader}. `value` is the admin-configured minimum
+ * (`null` models "no active config", so the service falls back to the domain
+ * Rp1.000 floor); `calls` records that it is read per request.
+ */
+function makeMinimumReader(value: number | null = null) {
+  let calls = 0;
+  return {
+    get calls() {
+      return calls;
+    },
+    async readMinimumPayoutIdr(): Promise<number | null> {
+      calls += 1;
+      return value;
+    },
+  } satisfies PayoutMinimumReader & { readonly calls: number };
+}
+
 let idSeq = 0;
 function makeService(
   earnings: FakeEarnings,
   ledger: FakeLedger,
   state: FakePayoutState,
+  minimum: PayoutMinimumReader = makeMinimumReader(),
 ): PayoutRequestService<Tx> {
   idSeq = 0;
   return new PayoutRequestService<Tx>({
@@ -182,6 +202,7 @@ function makeService(
     ledger,
     earnings,
     payouts: makePayoutRepo(state),
+    minimum,
     cipher: new FakeCipher(),
     clock: { nowEpochMs: () => NOW },
     idGenerator: { uuid: () => `uuid-${(idSeq += 1)}` },
@@ -290,6 +311,75 @@ describe("PayoutRequestService.requestPayout", () => {
     expect(result).toEqual({ ok: false, reason: "below_minimum" });
     expect(ledger.appended).toHaveLength(0);
     expect(earnings.get(EARNING_1)?.status).toBe("available");
+  });
+
+  it("enforces the admin-configured minimum above the domain default", async () => {
+    // Rp10.000 clears the domain Rp1.000 floor but not the admin Rp50.000 floor,
+    // so a wiring that ignored the config (the bug) would have let it through.
+    const earnings = new FakeEarnings([earning(EARNING_1, { amountIdr: 10_000 })]);
+    const ledger = new FakeLedger();
+    const state: FakePayoutState = { destination: destination(), payout: null, allocations: [], transition: null, audit: null };
+    const reader = makeMinimumReader(50_000);
+    const service = makeService(earnings, ledger, state, reader);
+
+    const result = await service.requestPayout({
+      caller: context(),
+      destinationId: DEST_ID,
+      earningIds: [EARNING_1],
+      requestId: REQUEST_ID,
+    });
+
+    expect(result).toEqual({ ok: false, reason: "below_minimum" });
+    expect(ledger.appended).toHaveLength(0);
+    expect(earnings.get(EARNING_1)?.status).toBe("available");
+    // The floor was read from the config for this request, not cached/ignored.
+    expect(reader.calls).toBe(1);
+  });
+
+  it("allows a request that meets the admin-configured minimum", async () => {
+    // Two Rp30.000 earnings total Rp60.000, at/above the Rp50.000 admin floor.
+    const earnings = new FakeEarnings([
+      earning(EARNING_1, { amountIdr: 30_000 }),
+      earning(EARNING_2, { amountIdr: 30_000 }),
+    ]);
+    const ledger = new FakeLedger();
+    const state: FakePayoutState = { destination: destination(), payout: null, allocations: [], transition: null, audit: null };
+    const service = makeService(earnings, ledger, state, makeMinimumReader(50_000));
+
+    const result = await service.requestPayout({
+      caller: context(),
+      destinationId: DEST_ID,
+      earningIds: [EARNING_1, EARNING_2],
+      requestId: REQUEST_ID,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payout.amountIdr).toBe(60_000);
+    expect(ledger.appended).toHaveLength(1);
+    expect(earnings.get(EARNING_1)?.status).toBe("requested");
+    expect(earnings.get(EARNING_2)?.status).toBe("requested");
+  });
+
+  it("falls back to the domain minimum when no active config is published", async () => {
+    // Reader returns null (no active config); Rp1.500 clears the domain Rp1.000
+    // floor, so the request proceeds — the fallback never disables the floor.
+    const earnings = new FakeEarnings([earning(EARNING_1, { amountIdr: 1500 })]);
+    const ledger = new FakeLedger();
+    const state: FakePayoutState = { destination: destination(), payout: null, allocations: [], transition: null, audit: null };
+    const service = makeService(earnings, ledger, state, makeMinimumReader(null));
+
+    const result = await service.requestPayout({
+      caller: context(),
+      destinationId: DEST_ID,
+      earningIds: [EARNING_1],
+      requestId: REQUEST_ID,
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.payout.amountIdr).toBe(1500);
+    expect(ledger.appended).toHaveLength(1);
   });
 
   it("rejects when a selected earning is not available", async () => {

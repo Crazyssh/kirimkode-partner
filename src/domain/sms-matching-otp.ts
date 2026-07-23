@@ -90,7 +90,12 @@ export type OtpParseResult =
     | "decoy_candidate" }>;
 const unicodeWordCharacter = /[\p{L}\p{N}_]/u;
 const unicodeDecimalDigit = /\p{Nd}/u;
-const directDecoyLabel = /(?:date|tanggal|phone|tel|nomor|telepon)\s*[:#-]?\s*$/iu;
+// The label must be a whole word: the leading negative lookbehind forbids a
+// preceding Unicode word character so a substring inside a longer word (the
+// `date` in `update`, `tel` in `hotel`, `phone` in `iPhone`) is not mistaken
+// for a phone/date decoy label and does not reject a legitimate adjacent OTP.
+const directDecoyLabel =
+  /(?<![\p{L}\p{N}_])(?:date|tanggal|phone|tel|nomor|telepon)\s*[:#-]?\s*$/iu;
 
 function hasKeyword(body: string, configuredKeywords: readonly string[]): boolean {
   const foldedBody = body.toLocaleLowerCase("en-US");

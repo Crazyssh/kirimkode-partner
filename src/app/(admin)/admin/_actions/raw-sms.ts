@@ -43,6 +43,13 @@ export async function reauthenticateAction(formData: FormData): Promise<void> {
       "Re-autentikasi berhasil. Akses SMS mentah aktif selama 15 menit.",
     );
   }
+  if (outcome.reason === "rate_limited") {
+    redirectWithFeedback(
+      SMS_ACCESS_PATH,
+      "error",
+      "Terlalu banyak percobaan re-autentikasi. Coba lagi nanti.",
+    );
+  }
   redirectWithFeedback(SMS_ACCESS_PATH, "error", "Kata sandi salah. Coba lagi.");
 }
 
