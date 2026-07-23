@@ -281,6 +281,16 @@ export class PayoutReviewService<Tx> {
         }
       }
 
+      // 2b. On reject/fail the Earnings return to `available`; release this
+      //     payout's allocations (keep the rows for audit, but stamp releasedAt
+      //     so each Earning leaves the partial unique index and can be requested
+      //     in a new payout). Without this the earning would be permanently
+      //     stranded — payable in the ledger but un-allocatable. `paid`
+      //     allocations are intentionally NOT released: that Earning is settled.
+      if (decision.earningNextStatus === "available") {
+        await this.deps.payouts.releaseAllocations(tx, partnerId, record.id, now);
+      }
+
       // 3. Append the zero-sum ledger event (idempotent on its unique eventKey).
       if (decision.transaction !== null) {
         await this.deps.ledger.appendTransaction(tx, {

@@ -856,6 +856,91 @@ describe.runIf(hasPostgres)("Ledger + payout concurrency integration (task 14.5)
       balances = await services.ledger.computeBucketBalances(tenant.partnerId);
       expect(balances.partner_available).toBe(MVP_PAYOUT_IDR);
     });
+
+    it("allows the unlocked Earning to be requested again in a fresh payout (no stranded funds)", async () => {
+      const tenant = await seedTenant(client);
+      const admin = await seedAdmin(client);
+      const destinationId = await seedDestination(services, tenant);
+      const seeded = await seedAvailableEarning(services, client, tenant, MVP_PAYOUT_IDR);
+
+      // First payout over the Earning is rejected: the Earning returns to
+      // available AND the allocation is released (releasedAt stamped, row kept).
+      const first = await services.requests.requestPayout({
+        caller: tenant.caller,
+        destinationId,
+        earningIds: [seeded.earningId],
+        requestId: randomUUID(),
+      });
+      if (!first.ok) throw new Error("first request failed");
+      const rejected = await services.reviews.reject({
+        admin,
+        payoutId: first.payout.id,
+        reason: "invalid destination details",
+        requestId: randomUUID(),
+      });
+      expect(rejected.ok).toBe(true);
+
+      const releasedAllocation = await client.payoutAllocation.findFirstOrThrow({
+        where: { payoutId: first.payout.id, earningId: seeded.earningId },
+      });
+      expect(releasedAllocation.releasedAt).not.toBeNull();
+
+      // The same Earning can now fund a SECOND payout: the released allocation
+      // no longer occupies the partial unique earningId slot. Before the fix
+      // this deterministically failed with earning_conflict forever, leaving
+      // the funds reported available yet permanently unwithdrawable.
+      const second = await services.requests.requestPayout({
+        caller: tenant.caller,
+        destinationId,
+        earningIds: [seeded.earningId],
+        requestId: randomUUID(),
+      });
+      expect(second.ok).toBe(true);
+      if (!second.ok) throw new Error("unreachable");
+
+      const earning = await client.partnerEarning.findUniqueOrThrow({
+        where: { id: seeded.earningId },
+      });
+      expect(earning.status).toBe("REQUESTED");
+
+      // Audit trail intact: both allocations exist — the released one from the
+      // rejected payout and exactly one ACTIVE one from the new payout.
+      const allocations = await client.payoutAllocation.findMany({
+        where: { earningId: seeded.earningId },
+        orderBy: { createdAt: "asc" },
+      });
+      expect(allocations).toHaveLength(2);
+      expect(allocations.filter((a) => a.releasedAt === null)).toHaveLength(1);
+      expect(
+        allocations.find((a) => a.releasedAt === null)?.payoutId,
+      ).toBe(second.payout.id);
+
+      // The second payout settles to paid end-to-end: the funds actually leave.
+      const approved = await services.reviews.approve({
+        admin,
+        payoutId: second.payout.id,
+        requestId: randomUUID(),
+      });
+      expect(approved.ok).toBe(true);
+      const processing = await services.reviews.markProcessing({
+        admin,
+        payoutId: second.payout.id,
+        requestId: randomUUID(),
+      });
+      expect(processing.ok).toBe(true);
+      const paid = await services.reviews.markPaid({
+        admin,
+        payoutId: second.payout.id,
+        paymentReference: `REF-${second.payout.id.slice(0, 8)}`,
+        requestId: randomUUID(),
+      });
+      expect(paid.ok).toBe(true);
+
+      const balances = await services.ledger.computeBucketBalances(tenant.partnerId);
+      expect(balances.partner_paid).toBe(MVP_PAYOUT_IDR);
+      expect(balances.partner_available).toBe(0);
+      expect(balances.partner_payout_locked).toBe(0);
+    });
   });
 
   // Requirement 14.6 / 20.2: a simulated crash between the payout lock and the

@@ -104,6 +104,8 @@ interface FakePayoutStore {
   transitions: RecordPayoutTransitionInput[];
   audits: AuditWriteInput[];
   usedReferences: Set<string>;
+  /** payoutIds whose allocations were released (reject/fail), in call order. */
+  releasedPayoutIds: string[];
 }
 
 function makePayoutRepo(store: FakePayoutStore): PayoutAdminRepository<Tx> {
@@ -131,6 +133,9 @@ function makePayoutRepo(store: FakePayoutStore): PayoutAdminRepository<Tx> {
           input.paymentReference ?? store.record.paymentReference,
       };
       return { outcome: "updated" };
+    },
+    async releaseAllocations(_tx, _partnerId, payoutId) {
+      store.releasedPayoutIds.push(payoutId);
     },
     async recordTransition(_tx, _partnerId, input) {
       store.transitions.push(input);
@@ -210,7 +215,13 @@ function makeService(
 }
 
 function makeStore(record: PayoutAdminRecord): FakePayoutStore {
-  return { record, transitions: [], audits: [], usedReferences: new Set() };
+  return {
+    record,
+    transitions: [],
+    audits: [],
+    usedReferences: new Set(),
+    releasedPayoutIds: [],
+  };
 }
 
 // **Validates: Requirements 14.3, 14.4, 14.5, 14.6, 14.7, 16.6, 23.3**
@@ -278,6 +289,9 @@ describe("PayoutReviewService", () => {
     expect(meta.paymentReference).toBe("BCA-REF-001");
     expect(meta.method).toBe("bank_transfer_manual");
     expect(meta.change).toBe("paid");
+    // A settled (paid) payout keeps its allocations bound to the earnings — the
+    // earnings are `paid`, never re-requestable, so nothing is released.
+    expect(store.releasedPayoutIds).toEqual([]);
   });
 
   it("rejects a payout, unlocks earnings requested -> available, and appends payout-unlock", async () => {
@@ -303,6 +317,9 @@ describe("PayoutReviewService", () => {
         ?.amountIdrSigned,
     ).toBe(2000);
     expect(store.transitions[0]?.reason).toBe("Rekening tidak valid");
+    // The allocations are released so the returned-to-available earnings are no
+    // longer held by the partial unique index and can be requested again.
+    expect(store.releasedPayoutIds).toEqual([PAYOUT_ID]);
   });
 
   it("is idempotent: a repeated reject on an already-rejected payout is a no-op success", async () => {
@@ -322,6 +339,29 @@ describe("PayoutReviewService", () => {
     // No second unlock event and no transition recorded.
     expect(ledger.appended).toHaveLength(0);
     expect(store.transitions).toHaveLength(0);
+    // The no-op short-circuits before the transaction: no second release.
+    expect(store.releasedPayoutIds).toEqual([]);
+  });
+
+  it("fails a processing payout, unlocks earnings, and releases its allocations", async () => {
+    const earnings = lockedEarnings();
+    const ledger = new FakeLedger();
+    const store = makeStore(payoutRecord("processing"));
+    const service = makeService(earnings, ledger, store);
+
+    const result = await service.fail({
+      admin: admin(),
+      payoutId: PAYOUT_ID,
+      requestId: REQUEST_ID,
+      reason: "Transfer bank ditolak",
+    });
+
+    expect(result).toEqual({ ok: true, status: "failed" });
+    expect(earnings.get(EARNING_1)?.status).toBe("available");
+    expect(earnings.get(EARNING_2)?.status).toBe("available");
+    expect(ledger.appended[0].eventKey).toBe(payoutUnlockEventKey(PAYOUT_ID));
+    // Allocations released so the earnings can be requested in a new payout.
+    expect(store.releasedPayoutIds).toEqual([PAYOUT_ID]);
   });
 
   it("forbids an admin without the payout:review permission", async () => {

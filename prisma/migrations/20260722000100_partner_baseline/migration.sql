@@ -551,6 +551,7 @@ CREATE TABLE "payout_allocations" (
     "payoutId" UUID NOT NULL,
     "earningId" UUID NOT NULL,
     "amountIdr" INTEGER NOT NULL,
+    "releasedAt" TIMESTAMPTZ(6),
     "createdAt" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "payout_allocations_pkey" PRIMARY KEY ("id")
@@ -882,7 +883,11 @@ CREATE INDEX "partner_payouts_processedByAdminId_status_idx" ON "partner_payouts
 CREATE UNIQUE INDEX "partner_payouts_id_partnerId_key" ON "partner_payouts"("id", "partnerId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "payout_allocations_earningId_key" ON "payout_allocations"("earningId");
+-- Partial unique: an Earning may sit in at most one ACTIVE allocation. A payout
+-- that is rejected/failed sets releasedAt on its allocations (see
+-- partner_guard_allocation_mutation), removing them from this index so the
+-- returned-to-available Earning can be requested again without being stranded.
+CREATE UNIQUE INDEX "payout_allocations_earningId_key" ON "payout_allocations"("earningId") WHERE "releasedAt" IS NULL;
 
 -- CreateIndex
 CREATE INDEX "payout_allocations_partnerId_payoutId_idx" ON "payout_allocations"("partnerId", "payoutId");
@@ -1148,11 +1153,28 @@ DECLARE target_id UUID; payout_status "PartnerPayoutStatus";
 BEGIN
   target_id := CASE WHEN TG_OP = 'DELETE' THEN OLD."payoutId" ELSE NEW."payoutId" END;
   SELECT "status" INTO payout_status FROM "partner_payouts" WHERE "id" = target_id;
-  IF payout_status IS DISTINCT FROM 'requested' THEN
-    RAISE EXCEPTION 'payout allocations are immutable after requested state';
+  -- While the payout is still `requested`, allocations are fully mutable.
+  IF payout_status = 'requested' THEN
+    IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    RETURN NEW;
   END IF;
-  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
-  RETURN NEW;
+  -- After `requested`, the ONLY permitted mutation is the one-way release of an
+  -- allocation whose payout is rejected/failed: set releasedAt once with every
+  -- other column unchanged. The row is kept for audit but leaves the partial
+  -- unique index so the returned-to-available Earning can be requested again.
+  IF TG_OP = 'UPDATE'
+     AND payout_status IN ('rejected', 'failed')
+     AND OLD."releasedAt" IS NULL
+     AND NEW."releasedAt" IS NOT NULL
+     AND NEW."id" = OLD."id"
+     AND NEW."partnerId" = OLD."partnerId"
+     AND NEW."payoutId" = OLD."payoutId"
+     AND NEW."earningId" = OLD."earningId"
+     AND NEW."amountIdr" = OLD."amountIdr"
+     AND NEW."createdAt" = OLD."createdAt" THEN
+    RETURN NEW;
+  END IF;
+  RAISE EXCEPTION 'payout allocations are immutable after requested state';
 END;
 $$;
 CREATE TRIGGER payout_allocations_state_guard BEFORE INSERT OR UPDATE OR DELETE ON "payout_allocations"

@@ -151,6 +151,22 @@ export class PrismaPayoutReviewGateway
     }
   }
 
+  async releaseAllocations(
+    tx: PartnerTransactionClient,
+    partnerId: string,
+    payoutId: string,
+    releasedAtEpochMs: number,
+  ): Promise<void> {
+    // Stamp releasedAt on this payout's still-active allocations. Only rows with
+    // releasedAt IS NULL are matched, so a retried reject/fail is a no-op. The
+    // guard trigger permits this one-way release because the payout status is
+    // already rejected/failed at this point in the transaction.
+    await tx.payoutAllocation.updateMany({
+      where: { payoutId, partnerId, releasedAt: null },
+      data: { releasedAt: new Date(releasedAtEpochMs) },
+    });
+  }
+
   async recordTransition(
     tx: PartnerTransactionClient,
     partnerId: string,

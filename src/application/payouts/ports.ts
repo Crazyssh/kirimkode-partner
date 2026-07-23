@@ -333,6 +333,22 @@ export interface PayoutAdminRepository<Tx> {
     input: UpdatePayoutStatusInput,
   ): Promise<UpdatePayoutStatusResult>;
 
+  /**
+   * Release the payout's still-active allocations by stamping `releasedAt` on
+   * them (idempotent: only rows still `releasedAt IS NULL` are touched). Called
+   * on a `rejected`/`failed` transition AFTER the status CAS, so the guard
+   * trigger permits the one-way release. Keeping the rows preserves the audit
+   * trail while freeing each returned-to-available Earning from the partial
+   * unique `earningId` index, so it can be requested in a fresh payout instead
+   * of being permanently stranded.
+   */
+  releaseAllocations(
+    tx: Tx,
+    partnerId: string,
+    payoutId: string,
+    releasedAtEpochMs: number,
+  ): Promise<void>;
+
   /** Record the payout transition (audit trail, requirement 14.7). */
   recordTransition(
     tx: Tx,

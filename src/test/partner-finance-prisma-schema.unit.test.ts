@@ -55,7 +55,13 @@ describe("Task 3.3 Partner finance and reconciliation Prisma schema", () => {
 
     expect(earning).toMatch(/orderId\s+String\s+@unique\s+@db\.Uuid/);
     expect(transaction).toMatch(/eventKey\s+String\s+@unique/);
-    expect(allocation).toMatch(/earningId\s+String\s+@unique\s+@db\.Uuid/);
+    // earningId is NOT globally unique: the whole-Earning lock is a PARTIAL
+    // unique (WHERE releasedAt IS NULL), materialized in the baseline migration,
+    // so a rejected/failed payout's released allocation no longer strands its
+    // returned-to-available Earning. The column-level @unique would over-constrain.
+    expect(allocation).toMatch(/earningId\s+String\s+@db\.Uuid/);
+    expect(allocation).not.toMatch(/earningId\s+String\s+@unique/);
+    expect(allocation).toMatch(/releasedAt\s+DateTime\?\s+@db\.Timestamptz\(6\)/);
     expect(payout).toMatch(/paymentReference\s+String\?\s+@unique/);
     expect(block("model", "PayoutTransition")).toMatch(/operationKey\s+String\s+@unique/);
     expect(block("model", "JobLease")).toMatch(/name\s+String\s+@unique/);
