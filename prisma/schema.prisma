@@ -1,0 +1,883 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("PARTNER_DATABASE_URL")
+}
+
+enum PartnerStatus {
+  PENDING   @map("pending")
+  APPROVED  @map("approved")
+  SUSPENDED @map("suspended")
+  REJECTED  @map("rejected")
+}
+
+enum PartnerMemberRole {
+  OWNER  @map("owner")
+  MEMBER @map("member")
+}
+
+enum PartnerMemberStatus {
+  PENDING_VERIFICATION @map("pending_verification")
+  ACTIVE               @map("active")
+  SUSPENDED            @map("suspended")
+  DISABLED             @map("disabled")
+}
+
+enum PartnerAdminStatus {
+  ACTIVE   @map("active")
+  DISABLED @map("disabled")
+}
+
+enum OneTimeTokenType {
+  EMAIL_VERIFICATION @map("email_verification")
+  PASSWORD_RESET     @map("password_reset")
+}
+
+enum CredentialStatus {
+  ACTIVE     @map("active")
+  SUPERSEDED @map("superseded")
+  REVOKED    @map("revoked")
+}
+
+enum AuditActorType {
+  PARTNER_MEMBER @map("partner_member")
+  PARTNER_ADMIN  @map("partner_admin")
+  DEVICE         @map("device")
+  SERVICE        @map("service")
+  SYSTEM         @map("system")
+  CRON           @map("cron")
+}
+
+enum AuditResult {
+  SUCCEEDED @map("succeeded")
+  FAILED    @map("failed")
+  DENIED    @map("denied")
+}
+
+enum SecurityEventCategory {
+  AUTHENTICATION_FAILURE @map("authentication_failure")
+  REPLAY_ATTEMPT         @map("replay_attempt")
+  RATE_LIMITED           @map("rate_limited")
+  OWNERSHIP_VIOLATION    @map("ownership_violation")
+  SENSITIVE_DATA_ACCESS  @map("sensitive_data_access")
+  CREDENTIAL_EVENT       @map("credential_event")
+}
+
+enum SecurityEventResult {
+  OBSERVED @map("observed")
+  BLOCKED  @map("blocked")
+  ALLOWED  @map("allowed")
+}
+
+model Partner {
+  id                String             @id @default(uuid()) @db.Uuid
+  legalName         String             @db.VarChar(200)
+  displayName       String             @db.VarChar(120)
+  status            PartnerStatus      @default(PENDING)
+  simulatorAllowed  Boolean            @default(false)
+  statusReason      String?            @db.VarChar(500)
+  approvedAt        DateTime?          @db.Timestamptz(6)
+  createdAt         DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime           @updatedAt @db.Timestamptz(6)
+  members           PartnerMember[]
+  sessions          PartnerSession[]
+  oneTimeTokens     OneTimeToken[]
+  devices           PartnerDevice[]
+  deviceCredentials DeviceCredential[]
+  numbers           PartnerNumber[]
+  offers            PartnerOffer[]
+  orders                 PartnerOrder[]
+  earnings               PartnerEarning[]
+  ledgerTransactions     LedgerTransaction[]
+  ledgerEntries          LedgerEntry[]
+  payoutDestinations     PayoutDestination[]
+  payouts                PartnerPayout[]
+  payoutAllocations      PayoutAllocation[]
+  payoutTransitions      PayoutTransition[]
+  reconciliationIssues   ReconciliationIssue[]
+  auditEvents            AuditEvent[]
+  securityEvents         SecurityEvent[]
+
+  @@index([status, createdAt])
+  @@map("partners")
+}
+
+model PartnerMember {
+  id              String              @id @default(uuid()) @db.Uuid
+  partnerId       String              @db.Uuid
+  emailNormalized String              @unique @db.VarChar(320)
+  passwordHash    String              @db.VarChar(255)
+  role            PartnerMemberRole
+  emailVerifiedAt DateTime?           @db.Timestamptz(6)
+  securityVersion Int                 @default(1)
+  status          PartnerMemberStatus @default(PENDING_VERIFICATION)
+  createdAt       DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime            @updatedAt @db.Timestamptz(6)
+  partner         Partner             @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  sessions        PartnerSession[]
+  oneTimeTokens   OneTimeToken[]
+  payoutsCreated  PartnerPayout[]   @relation("PayoutCreatedByMember")
+
+  @@unique([id, partnerId])
+  @@index([partnerId, role, status])
+  @@map("partner_members")
+}
+
+model PartnerSession {
+  id              String        @id @default(uuid()) @db.Uuid
+  memberId        String        @db.Uuid
+  partnerId       String        @db.Uuid
+  tokenHash       String        @unique @db.Char(64)
+  securityVersion Int
+  expiresAt       DateTime      @db.Timestamptz(6)
+  idleExpiresAt   DateTime      @db.Timestamptz(6)
+  lastUsedAt      DateTime?     @db.Timestamptz(6)
+  revokedAt       DateTime?     @db.Timestamptz(6)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  member          PartnerMember @relation(fields: [memberId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  partner         Partner       @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([partnerId, revokedAt, expiresAt])
+  @@index([memberId, revokedAt])
+  @@index([idleExpiresAt])
+  @@map("partner_sessions")
+}
+
+model OneTimeToken {
+  id        String           @id @default(uuid()) @db.Uuid
+  memberId  String           @db.Uuid
+  partnerId String           @db.Uuid
+  type      OneTimeTokenType
+  tokenHash String           @unique @db.Char(64)
+  expiresAt DateTime         @db.Timestamptz(6)
+  usedAt    DateTime?        @db.Timestamptz(6)
+  createdAt DateTime         @default(now()) @db.Timestamptz(6)
+  member    PartnerMember    @relation(fields: [memberId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  partner   Partner          @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([memberId, type, usedAt, expiresAt])
+  @@index([partnerId, createdAt])
+  @@map("one_time_tokens")
+}
+
+model PartnerAdmin {
+  id              String             @id @default(uuid()) @db.Uuid
+  emailNormalized String             @unique @db.VarChar(320)
+  passwordHash    String             @db.VarChar(255)
+  permissions     String[]           @default([])
+  securityVersion Int                @default(1)
+  status          PartnerAdminStatus @default(ACTIVE)
+  lastLoginAt     DateTime?          @db.Timestamptz(6)
+  createdAt       DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime           @updatedAt @db.Timestamptz(6)
+  sessions        PartnerAdminSession[]
+  platformConfigs PlatformConfig[]
+  payoutsProcessed PartnerPayout[] @relation("PayoutProcessedByAdmin")
+
+  @@index([status])
+  @@map("partner_admins")
+}
+
+// Opaque admin-realm session (task 7.5). The `/admin` realm is separate from
+// the tenant PartnerSession: an admin session is bound to a global PartnerAdmin
+// and carries no partnerId. Only the SHA-256 token hash is stored.
+model PartnerAdminSession {
+  id              String       @id @default(uuid()) @db.Uuid
+  adminId         String       @db.Uuid
+  tokenHash       String       @unique @db.Char(64)
+  securityVersion Int
+  expiresAt       DateTime     @db.Timestamptz(6)
+  idleExpiresAt   DateTime     @db.Timestamptz(6)
+  lastUsedAt      DateTime?    @db.Timestamptz(6)
+  revokedAt       DateTime?    @db.Timestamptz(6)
+  createdAt       DateTime     @default(now()) @db.Timestamptz(6)
+  admin           PartnerAdmin @relation(fields: [adminId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([adminId, revokedAt, expiresAt])
+  @@index([idleExpiresAt])
+  @@map("partner_admin_sessions")
+}
+
+model PartnerDevice {
+  id               String               @id @default(uuid()) @db.Uuid
+  partnerId        String               @db.Uuid
+  type             PartnerDeviceType
+  label            String               @db.VarChar(120)
+  effectiveStatus  PartnerDeviceStatus  @default(OFFLINE)
+  disabledAt       DateTime?            @db.Timestamptz(6)
+  lastSeenAt       DateTime?            @db.Timestamptz(6)
+  agentVersion     String?              @db.VarChar(64)
+  capabilitiesJson Json                 @default("{}")
+  metadataJson     Json?
+  createdAt        DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime             @updatedAt @db.Timestamptz(6)
+  partner          Partner              @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  credentials      DeviceCredential[]
+  heartbeats       DeviceHeartbeat[]
+  numbers          PartnerNumber[]
+  sms              PartnerSms[]
+
+  @@unique([id, partnerId])
+  @@index([partnerId, effectiveStatus, lastSeenAt])
+  @@index([effectiveStatus, lastSeenAt])
+  @@map("partner_devices")
+}
+
+model DeviceCredential {
+  id         String           @id @default(uuid()) @db.Uuid
+  partnerId  String           @db.Uuid
+  deviceId   String           @db.Uuid
+  publicId   String           @unique @db.VarChar(80)
+  secretHash String           @unique @db.Char(64)
+  status     CredentialStatus @default(ACTIVE)
+  createdAt  DateTime         @default(now()) @db.Timestamptz(6)
+  revokedAt  DateTime?        @db.Timestamptz(6)
+  lastUsedAt DateTime?        @db.Timestamptz(6)
+  partner    Partner          @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  device     PartnerDevice    @relation(fields: [deviceId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([partnerId, deviceId, status])
+  @@map("device_credentials")
+}
+
+model ServiceCredential {
+  id         String           @id @default(uuid()) @db.Uuid
+  clientId   String           @db.VarChar(100)
+  keyId      String           @db.VarChar(100)
+  secretHash String           @unique @db.Char(64)
+  status     CredentialStatus @default(ACTIVE)
+  createdAt  DateTime         @default(now()) @db.Timestamptz(6)
+  rotatedAt  DateTime?        @db.Timestamptz(6)
+  revokedAt  DateTime?        @db.Timestamptz(6)
+  lastUsedAt DateTime?        @db.Timestamptz(6)
+
+  @@unique([clientId, keyId])
+  @@index([clientId, status])
+  @@map("service_credentials")
+}
+
+model AuditEvent {
+  id               String         @id @default(uuid()) @db.Uuid
+  partnerId        String?        @db.Uuid
+  actorType        AuditActorType
+  actorRefHash     String         @db.Char(64)
+  action           String         @db.VarChar(120)
+  targetType       String         @db.VarChar(100)
+  targetId         String         @db.VarChar(128)
+  result           AuditResult
+  safeMetadataJson Json?
+  requestId        String         @db.Uuid
+  createdAt        DateTime       @default(now()) @db.Timestamptz(6)
+  partner          Partner?       @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  resolvedReconciliationIssues ReconciliationIssue[] @relation("ReconciliationResolutionAudit")
+
+  @@index([partnerId, createdAt])
+  @@index([actorType, actorRefHash, createdAt])
+  @@index([targetType, targetId, createdAt])
+  @@index([action, createdAt])
+  @@index([requestId])
+  @@map("audit_events")
+}
+
+model SecurityEvent {
+  id               String                @id @default(uuid()) @db.Uuid
+  partnerId        String?               @db.Uuid
+  principalHash    String                @db.Char(64)
+  category         SecurityEventCategory
+  result           SecurityEventResult
+  networkHash      String?               @db.Char(64)
+  safeMetadataJson Json?
+  requestId        String                @db.Uuid
+  createdAt        DateTime              @default(now()) @db.Timestamptz(6)
+  partner          Partner?              @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([partnerId, createdAt])
+  @@index([principalHash, createdAt])
+  @@index([category, result, createdAt])
+  @@index([requestId])
+  @@map("security_events")
+}
+
+model PlatformConfig {
+  id                             String        @id @default(uuid()) @db.Uuid
+  version                        Int           @unique
+  serviceCode                    String        @db.VarChar(32)
+  countryCode                    String        @db.Char(2)
+  operatorCode                   String        @db.VarChar(32)
+  currency                       String        @db.Char(3)
+  minBasePriceIdr                Int
+  maxBasePriceIdr                Int
+  fixedFeeIdr                    Int
+  markupBps                      Int
+  roundToIdr                     Int
+  heartbeatIntervalSeconds       Int
+  heartbeatTimeoutSeconds        Int
+  heartbeatSweepSeconds          Int
+  orderTimeoutSeconds            Int
+  cancelMinimumSeconds           Int
+  reservationRecoverySeconds     Int
+  earningHoldSeconds             Int
+  minimumPayoutIdr               Int
+  smsRawRetentionDays            Int
+  otpRetentionHours              Int
+  heartbeatMetadataRetentionDays Int
+  securityEventRetentionDays     Int
+  auditRetentionDays             Int
+  financialRetentionDays         Int
+  simulatorAllowlistJson         Json
+  activeKey                      String?       @unique @db.VarChar(32)
+  activeFrom                     DateTime      @db.Timestamptz(6)
+  retiredAt                      DateTime?     @db.Timestamptz(6)
+  createdByAdminId               String?       @db.Uuid
+  createdAt                      DateTime      @default(now()) @db.Timestamptz(6)
+  createdByAdmin                 PartnerAdmin? @relation(fields: [createdByAdminId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([activeFrom, retiredAt])
+  @@index([serviceCode, countryCode, operatorCode, activeFrom])
+  @@index([createdByAdminId])
+  @@map("platform_configs")
+}
+
+model DeviceHeartbeat {
+  id           String        @id @default(uuid()) @db.Uuid
+  deviceId     String        @db.Uuid
+  receivedAt   DateTime      @default(now()) @db.Timestamptz(6)
+  signal       Int?
+  operator     String?       @db.VarChar(64)
+  health       Json?
+  agentVersion String?       @db.VarChar(64)
+  device       PartnerDevice @relation(fields: [deviceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([deviceId, receivedAt(sort: Desc)])
+  @@index([receivedAt])
+  @@map("device_heartbeats")
+}
+
+model PartnerNumber {
+  id                    String               @id @default(uuid()) @db.Uuid
+  partnerId             String               @db.Uuid
+  deviceId              String               @db.Uuid
+  canonicalNumber       String               @db.VarChar(20)
+  activeCanonicalNumber String?              @unique @db.VarChar(20)
+  countryCode           String               @db.Char(2)
+  operatorCode          String               @db.VarChar(32)
+  status                PartnerNumberStatus  @default(OFFLINE)
+  enabled               Boolean              @default(true)
+  currentOrderId        String?              @unique @db.Uuid
+  createdAt             DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime             @updatedAt @db.Timestamptz(6)
+  partner               Partner              @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  device                PartnerDevice        @relation(fields: [deviceId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  currentOrder          PartnerOrder?        @relation("CurrentNumberOrder", fields: [currentOrderId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  orders                PartnerOrder[]       @relation("NumberOrders")
+  stateHistory          NumberStateHistory[]
+  sms                   PartnerSms[]
+
+  @@unique([id, partnerId])
+  @@index([status, enabled, countryCode, operatorCode, id])
+  @@index([partnerId, status, enabled, countryCode, operatorCode])
+  @@index([deviceId, status, enabled])
+  @@map("partner_numbers")
+}
+
+model NumberStateHistory {
+  id             String               @id @default(uuid()) @db.Uuid
+  numberId       String               @db.Uuid
+  fromStatus     PartnerNumberStatus?
+  toStatus       PartnerNumberStatus
+  actorType      AuditActorType
+  actorRefHash   String               @db.Char(64)
+  reason         String?              @db.VarChar(500)
+  operationKey   String?              @unique @db.VarChar(255)
+  createdAt      DateTime             @default(now()) @db.Timestamptz(6)
+  number         PartnerNumber        @relation(fields: [numberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([numberId, createdAt])
+  @@index([toStatus, createdAt])
+  @@map("number_state_history")
+}
+
+model PartnerOffer {
+  id                 String             @id @default(uuid()) @db.Uuid
+  partnerId          String             @db.Uuid
+  serviceCode        String             @db.VarChar(32)
+  countryCode        String             @db.Char(2)
+  operatorCode       String             @db.VarChar(32)
+  basePriceIdr       Int
+  status             PartnerOfferStatus @default(INACTIVE)
+  configVersion      Int
+  activeDimensionKey String?            @unique @db.VarChar(160)
+  createdAt          DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(6)
+  partner            Partner            @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  orders             PartnerOrder[]
+
+  @@unique([id, partnerId])
+  @@index([status, serviceCode, countryCode, operatorCode, partnerId])
+  @@index([partnerId, status, serviceCode, countryCode, operatorCode])
+  @@map("partner_offers")
+}
+
+model PartnerOrder {
+  id               String             @id @default(uuid()) @db.Uuid
+  buyerOrderRef    String             @unique @db.VarChar(128)
+  buyerAccountRef  String             @db.VarChar(128)
+  partnerId        String             @db.Uuid
+  numberId         String             @db.Uuid
+  offerId          String             @db.Uuid
+  status           PartnerOrderStatus @default(CREATED)
+  otpCiphertext    Bytes?
+  otpKeyVersion    Int?
+  otpFingerprint   String?            @db.Char(64)
+  expiresAt        DateTime           @db.Timestamptz(6)
+  terminalReason   String?            @db.VarChar(500)
+  createdAt        DateTime           @default(now()) @db.Timestamptz(6)
+  reservedAt       DateTime?          @db.Timestamptz(6)
+  waitingAt        DateTime?          @db.Timestamptz(6)
+  succeededAt      DateTime?          @db.Timestamptz(6)
+  terminalAt       DateTime?          @db.Timestamptz(6)
+  version          Int                @default(1)
+  partner          Partner            @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  number           PartnerNumber      @relation("NumberOrders", fields: [numberId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  offer            PartnerOffer       @relation(fields: [offerId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  currentForNumber PartnerNumber?     @relation("CurrentNumberOrder")
+  snapshot         OrderSnapshot?
+  transitions      OrderTransition[]
+  sms              PartnerSms[]
+  earning          PartnerEarning?
+
+  @@unique([id, partnerId])
+  @@index([numberId, status, createdAt])
+  @@index([partnerId, status, createdAt])
+  @@index([buyerAccountRef, createdAt])
+  @@index([status, expiresAt])
+  @@map("partner_orders")
+}
+
+// Immutable reserve-time value object: the orderId primary key enforces exactly one
+// snapshot per order and the absence of updatedAt makes mutation outside creation explicit.
+// Task 3.4 SQL must add UPDATE/DELETE protection because Prisma has no immutable-table primitive.
+model OrderSnapshot {
+  orderId            String       @id @db.Uuid
+  serviceCode        String       @db.VarChar(32)
+  countryCode        String       @db.Char(2)
+  operatorCode       String       @db.VarChar(32)
+  canonicalNumber    String       @db.VarChar(20)
+  basePriceIdr       Int
+  retailPriceIdr     Int
+  payoutIdr          Int
+  platformMarginIdr  Int
+  currency           String       @db.Char(3)
+  configVersion      Int
+  order              PartnerOrder @relation(fields: [orderId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([serviceCode, countryCode, operatorCode])
+  @@map("order_snapshots")
+}
+
+model OrderTransition {
+  id           String             @id @default(uuid()) @db.Uuid
+  orderId      String             @db.Uuid
+  fromStatus   PartnerOrderStatus?
+  toStatus     PartnerOrderStatus
+  actorType    AuditActorType
+  actorRefHash String             @db.Char(64)
+  reason       String?            @db.VarChar(500)
+  operationKey String             @unique @db.VarChar(255)
+  createdAt    DateTime           @default(now()) @db.Timestamptz(6)
+  order        PartnerOrder       @relation(fields: [orderId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([orderId, createdAt])
+  @@index([toStatus, createdAt])
+  @@map("order_transitions")
+}
+
+model PartnerSms {
+  id                 String         @id @default(uuid()) @db.Uuid
+  deviceId           String         @db.Uuid
+  numberId           String         @db.Uuid
+  messageId          String         @db.VarChar(255)
+  idempotencyKey     String         @db.VarChar(255)
+  senderCiphertext   Bytes
+  bodyCiphertext     Bytes
+  keyVersion         Int
+  bodyFingerprint    String         @db.Char(64)
+  receivedAtDevice   DateTime       @db.Timestamptz(6)
+  receivedAtServer   DateTime       @default(now()) @db.Timestamptz(6)
+  matchStatus        SmsMatchStatus @default(PENDING)
+  matchedOrderId     String?        @db.Uuid
+  extractedAt        DateTime?      @db.Timestamptz(6)
+  redactedAt         DateTime?      @db.Timestamptz(6)
+  device             PartnerDevice  @relation(fields: [deviceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  number             PartnerNumber  @relation(fields: [numberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  matchedOrder       PartnerOrder?  @relation(fields: [matchedOrderId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([deviceId, messageId])
+  @@unique([deviceId, idempotencyKey])
+  @@index([numberId, receivedAtServer])
+  @@index([matchedOrderId])
+  @@index([matchStatus, receivedAtServer])
+  @@index([redactedAt, receivedAtServer])
+  @@map("partner_sms")
+}
+
+model IdempotencyRecord {
+  id             String           @id @default(uuid()) @db.Uuid
+  scope          String           @db.VarChar(100)
+  principalId    String           @db.VarChar(128)
+  key            String           @db.VarChar(255)
+  requestHash    String           @db.Char(64)
+  responseStatus Int?
+  responseJson   Json?
+  state          IdempotencyState @default(PROCESSING)
+  expiresAt      DateTime         @db.Timestamptz(6)
+  createdAt      DateTime         @default(now()) @db.Timestamptz(6)
+
+  @@unique([scope, principalId, key])
+  @@index([expiresAt])
+  @@index([scope, state, createdAt])
+  @@map("idempotency_records")
+}
+
+model ReplayNonce {
+  id          String   @id @default(uuid()) @db.Uuid
+  principalId String   @db.VarChar(128)
+  nonceHash   String   @db.Char(64)
+  expiresAt   DateTime @db.Timestamptz(6)
+  createdAt   DateTime @default(now()) @db.Timestamptz(6)
+
+  @@unique([principalId, nonceHash])
+  @@index([expiresAt])
+  @@map("replay_nonces")
+}
+
+// DB-only invariants reserved for the Task 3.4 baseline migration:
+// - CHECK non-negative monetary values and internally consistent snapshot amounts.
+// - CHECK activeCanonicalNumber mirrors canonicalNumber iff the number is non-disabled/enabled.
+// - CHECK activeDimensionKey is present only for active offers and matches its tenant/dimensions.
+// - Partial UNIQUE PartnerOrder(numberId) WHERE status IN (created,reserved,waiting_sms).
+// - Trigger/privilege guard preventing UPDATE or DELETE of OrderSnapshot rows.
+
+enum PartnerDeviceType {
+  SIMULATOR @map("simulator")
+  ANDROID   @map("android")
+  MODEM     @map("modem")
+  GOIP      @map("goip")
+  API       @map("api")
+}
+
+enum PartnerDeviceStatus {
+  OFFLINE  @map("offline")
+  ONLINE   @map("online")
+  DISABLED @map("disabled")
+}
+
+enum PartnerNumberStatus {
+  OFFLINE   @map("offline")
+  AVAILABLE @map("available")
+  RESERVED  @map("reserved")
+  BUSY      @map("busy")
+  DISABLED  @map("disabled")
+}
+
+enum PartnerOfferStatus {
+  INACTIVE @map("inactive")
+  ACTIVE   @map("active")
+  DISABLED @map("disabled")
+}
+
+enum PartnerOrderStatus {
+  CREATED     @map("created")
+  RESERVED    @map("reserved")
+  WAITING_SMS @map("waiting_sms")
+  SUCCESS     @map("success")
+  CANCELLED   @map("cancelled")
+  TIMEOUT     @map("timeout")
+  FAILED      @map("failed")
+}
+
+enum SmsMatchStatus {
+  PENDING   @map("pending")
+  MATCHED   @map("matched")
+  UNMATCHED @map("unmatched")
+  AMBIGUOUS @map("ambiguous")
+}
+
+enum IdempotencyState {
+  PROCESSING @map("processing")
+  COMPLETED  @map("completed")
+  FAILED     @map("failed")
+}
+
+// Task 3.3 financial projections and operational recovery records. Monetary
+// workflow state is explicit here; the ledger entries remain the balance source.
+model PartnerEarning {
+  id          String               @id @default(uuid()) @db.Uuid
+  partnerId   String               @db.Uuid
+  orderId     String               @unique @db.Uuid
+  amountIdr   Int
+  status      PartnerEarningStatus @default(PENDING)
+  availableAt DateTime             @db.Timestamptz(6)
+  reversedAt  DateTime?            @db.Timestamptz(6)
+  createdAt   DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime             @updatedAt @db.Timestamptz(6)
+  partner     Partner              @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  order       PartnerOrder         @relation(fields: [orderId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  allocations PayoutAllocation[]
+
+  @@unique([id, partnerId])
+  @@unique([orderId, partnerId])
+  @@index([partnerId, status, availableAt])
+  @@index([status, availableAt])
+  @@index([status, updatedAt])
+  @@map("partner_earnings")
+}
+
+model LedgerTransaction {
+  id            String          @id @default(uuid()) @db.Uuid
+  partnerId     String          @db.Uuid
+  eventType     LedgerEventType
+  eventKey      String          @unique @db.VarChar(255)
+  referenceType String          @db.VarChar(80)
+  referenceId   String          @db.VarChar(128)
+  createdAt     DateTime        @default(now()) @db.Timestamptz(6)
+  partner       Partner         @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  entries       LedgerEntry[]
+
+  @@unique([id, partnerId])
+  @@index([partnerId, createdAt])
+  @@index([eventType, createdAt])
+  @@index([referenceType, referenceId, createdAt])
+  @@map("ledger_transactions")
+}
+
+model LedgerEntry {
+  id              String            @id @default(uuid()) @db.Uuid
+  transactionId   String            @db.Uuid
+  partnerId       String            @db.Uuid
+  bucket          LedgerBucket
+  amountIdrSigned Int
+  createdAt       DateTime          @default(now()) @db.Timestamptz(6)
+  transaction     LedgerTransaction @relation(fields: [transactionId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  partner         Partner           @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([transactionId, createdAt])
+  @@index([partnerId, bucket, createdAt])
+  @@map("ledger_entries")
+}
+
+model PayoutDestination {
+  id                      String                  @id @default(uuid()) @db.Uuid
+  partnerId               String                  @db.Uuid
+  bankCode                String                  @db.VarChar(32)
+  accountNumberCiphertext Bytes
+  keyVersion              Int
+  accountNumberLast4      String                  @db.Char(4)
+  accountHolderName       String                  @db.VarChar(160)
+  status                  PayoutDestinationStatus @default(ACTIVE)
+  createdAt               DateTime                @default(now()) @db.Timestamptz(6)
+  updatedAt               DateTime                @updatedAt @db.Timestamptz(6)
+  partner                 Partner                 @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  payouts                 PartnerPayout[]
+
+  @@unique([id, partnerId])
+  @@index([partnerId, status, createdAt])
+  @@map("payout_destinations")
+}
+
+model PartnerPayout {
+  id                               String              @id @default(uuid()) @db.Uuid
+  partnerId                        String              @db.Uuid
+  destinationId                    String              @db.Uuid
+  destinationSnapshotJsonEncrypted Bytes
+  amountIdr                        Int
+  status                           PartnerPayoutStatus @default(REQUESTED)
+  paymentMethod                    PayoutPaymentMethod @default(BANK_TRANSFER_MANUAL)
+  paymentReference                 String?             @unique @db.VarChar(160)
+  requestedAt                      DateTime            @default(now()) @db.Timestamptz(6)
+  paidAt                           DateTime?           @db.Timestamptz(6)
+  createdByMemberId                String              @db.Uuid
+  processedByAdminId               String?             @db.Uuid
+  failureReason                    String?             @db.VarChar(500)
+  version                          Int                 @default(1)
+  createdAt                        DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt                        DateTime            @updatedAt @db.Timestamptz(6)
+  partner                          Partner             @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  destination                      PayoutDestination   @relation(fields: [destinationId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  createdByMember                  PartnerMember       @relation("PayoutCreatedByMember", fields: [createdByMemberId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  processedByAdmin                 PartnerAdmin?       @relation("PayoutProcessedByAdmin", fields: [processedByAdminId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  allocations                      PayoutAllocation[]
+  transitions                      PayoutTransition[]
+
+  @@unique([id, partnerId])
+  @@index([partnerId, status, requestedAt])
+  @@index([status, requestedAt])
+  @@index([status, updatedAt])
+  @@index([processedByAdminId, status])
+  @@map("partner_payouts")
+}
+
+model PayoutAllocation {
+  id        String         @id @default(uuid()) @db.Uuid
+  partnerId String         @db.Uuid
+  payoutId  String         @db.Uuid
+  earningId String         @unique @db.Uuid
+  amountIdr Int
+  createdAt DateTime       @default(now()) @db.Timestamptz(6)
+  partner   Partner        @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  payout    PartnerPayout  @relation(fields: [payoutId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+  earning   PartnerEarning @relation(fields: [earningId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([payoutId, earningId])
+  @@index([partnerId, payoutId])
+  @@map("payout_allocations")
+}
+
+model PayoutTransition {
+  id           String              @id @default(uuid()) @db.Uuid
+  partnerId    String              @db.Uuid
+  payoutId     String              @db.Uuid
+  fromStatus   PartnerPayoutStatus?
+  toStatus     PartnerPayoutStatus
+  actorType    AuditActorType
+  actorRefHash String              @db.Char(64)
+  reason       String?             @db.VarChar(500)
+  operationKey String              @unique @db.VarChar(255)
+  createdAt    DateTime            @default(now()) @db.Timestamptz(6)
+  partner      Partner             @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  payout       PartnerPayout       @relation(fields: [payoutId, partnerId], references: [id, partnerId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([payoutId, createdAt])
+  @@index([partnerId, toStatus, createdAt])
+  @@index([toStatus, createdAt])
+  @@map("payout_transitions")
+}
+
+model JobLease {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @unique @db.VarChar(100)
+  ownerId    String   @db.VarChar(128)
+  leaseUntil DateTime @db.Timestamptz(6)
+  cursorJson Json?
+  createdAt  DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([leaseUntil])
+  @@index([ownerId, leaseUntil])
+  @@map("job_leases")
+}
+
+model ReconciliationIssue {
+  id                String                    @id @default(uuid()) @db.Uuid
+  partnerId         String                    @db.Uuid
+  type              ReconciliationIssueType
+  referenceId       String                    @db.VarChar(128)
+  severity          ReconciliationSeverity    @default(MEDIUM)
+  detailsSafeJson   Json
+  status            ReconciliationIssueStatus @default(OPEN)
+  detectedAt        DateTime                  @default(now()) @db.Timestamptz(6)
+  resolvedAt        DateTime?                 @db.Timestamptz(6)
+  resolutionAuditId String?                   @db.Uuid
+  updatedAt         DateTime                  @updatedAt @db.Timestamptz(6)
+  partner           Partner                   @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  resolutionAudit   AuditEvent?               @relation("ReconciliationResolutionAudit", fields: [resolutionAuditId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([partnerId, status, severity, detectedAt])
+  @@index([type, status, detectedAt])
+  @@index([referenceId, status])
+  @@index([status, detectedAt])
+  @@map("reconciliation_issues")
+}
+
+enum PartnerEarningStatus {
+  PENDING   @map("pending")
+  AVAILABLE @map("available")
+  REQUESTED @map("requested")
+  PAID      @map("paid")
+  REVERSED  @map("reversed")
+}
+
+enum LedgerEventType {
+  ORDER_SUCCESS     @map("order_success")
+  HOLD_RELEASE      @map("hold_release")
+  EARNING_REVERSAL  @map("earning_reversal")
+  PAYOUT_LOCK       @map("payout_lock")
+  PAYOUT_UNLOCK     @map("payout_unlock")
+  PAYOUT_PAID       @map("payout_paid")
+  MANUAL_ADJUSTMENT @map("manual_adjustment")
+}
+
+enum LedgerBucket {
+  PLATFORM_PARTNER_PAYABLE @map("platform_partner_payable")
+  PARTNER_PENDING          @map("partner_pending")
+  PARTNER_AVAILABLE        @map("partner_available")
+  PARTNER_PAYOUT_LOCKED    @map("partner_payout_locked")
+  PARTNER_PAID             @map("partner_paid")
+  PARTNER_REVERSED         @map("partner_reversed")
+}
+
+enum PayoutDestinationStatus {
+  ACTIVE   @map("active")
+  DISABLED @map("disabled")
+}
+
+enum PartnerPayoutStatus {
+  REQUESTED  @map("requested")
+  APPROVED   @map("approved")
+  PROCESSING @map("processing")
+  PAID       @map("paid")
+  REJECTED   @map("rejected")
+  FAILED     @map("failed")
+}
+
+enum PayoutPaymentMethod {
+  BANK_TRANSFER_MANUAL @map("bank_transfer_manual")
+}
+
+enum ReconciliationIssueType {
+  ORDER_NUMBER_MISMATCH       @map("order_number_mismatch")
+  EARNING_SNAPSHOT_MISMATCH   @map("earning_snapshot_mismatch")
+  LEDGER_IMBALANCE            @map("ledger_imbalance")
+  PAYOUT_ALLOCATION_MISMATCH  @map("payout_allocation_mismatch")
+  PROJECTION_LEDGER_MISMATCH  @map("projection_ledger_mismatch")
+  STALE_FINANCIAL_STATE       @map("stale_financial_state")
+}
+
+enum ReconciliationSeverity {
+  LOW      @map("low")
+  MEDIUM   @map("medium")
+  HIGH     @map("high")
+  CRITICAL @map("critical")
+}
+
+enum ReconciliationIssueStatus {
+  OPEN      @map("open")
+  RESOLVED  @map("resolved")
+  DISMISSED @map("dismissed")
+}
+
+// Additional DB-only invariants reserved precisely for Task 3.4 baseline SQL:
+// - CHECK PartnerEarning.amountIdr > 0, PartnerPayout.amountIdr > 0,
+//   PayoutAllocation.amountIdr > 0, and LedgerEntry.amountIdrSigned <> 0.
+// - DEFERRABLE constraint trigger at transaction commit requiring every
+//   LedgerTransaction to have at least two LedgerEntry rows whose signed sum is zero.
+// - Append-only UPDATE/DELETE denial triggers for LedgerTransaction and LedgerEntry;
+//   corrections must insert a compensating transaction with a new eventKey.
+// - Constraint trigger requiring PartnerEarning.amountIdr = OrderSnapshot.payoutIdr.
+// - Constraint trigger requiring each allocation to equal its whole Earning amount,
+//   each PartnerPayout.amountIdr to equal SUM(PayoutAllocation.amountIdr), and allocation
+//   rows to be immutable after payout leaves requested; earningId uniqueness above
+//   already prevents allocation to more than one payout.
+// - CHECK/trigger requiring PAID payouts to have paidAt, processedByAdminId, the
+//   bank_transfer_manual method, and a non-null paymentReference; PostgreSQL's unique
+//   constraint generated by @unique permits multiple NULLs but rejects duplicate
+//   non-null payment references.
+// - Trigger preventing mutation of destinationSnapshotJsonEncrypted after payout
+//   creation and preventing deletion of referenced PayoutDestination rows.
+// - CHECK requiring resolved/dismissed ReconciliationIssue rows to have resolvedAt
+//   and resolutionAuditId, OPEN rows to have neither, plus a trigger requiring the
+//   resolution AuditEvent to carry the same partnerId as the issue.

@@ -1,0 +1,49 @@
+{
+  "name": "@kirimkode/partner-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone KirimKode Partner Platform",
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "prisma:validate": "node scripts/run-prisma-schema-command.mjs validate",
+    "prisma:generate": "node scripts/run-prisma-schema-command.mjs generate",
+    "prisma:seed": "node prisma/seed.mjs",
+    "build": "npm run prisma:generate && next build",
+    "start": "node scripts/start-partner.mjs",
+    "lint": "eslint --no-cache .",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:property": "vitest run --config vitest.property.config.ts",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test": "npm run test:unit && npm run test:property && npm run test:integration",
+    "migration:check": "node scripts/check-migrations.mjs",
+    "migration:from-empty": "node scripts/migrate-from-empty.mjs",
+    "validate": "npm run prisma:validate && npm run migration:check && npm run lint && npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@node-rs/argon2": "2.0.2",
+    "@prisma/client": "6.19.0",
+    "next": "16.1.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.2.0",
+    "@types/node": "20.19.33",
+    "@types/pg": "8.15.5",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.2",
+    "eslint-config-next": "16.1.6",
+    "fast-check": "4.9.0",
+    "pg": "8.16.3",
+    "prisma": "6.19.0",
+    "tailwindcss": "4.2.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  },
+  "engines": {
+    "node": ">=20.9.0"
+  }
+}

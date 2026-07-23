@@ -1,0 +1,2 @@
+# Managed by Prisma Migrate. Partner repository/database only.
+provider = "postgresql"

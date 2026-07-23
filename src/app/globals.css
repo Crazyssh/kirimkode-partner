@@ -1,0 +1,62 @@
+@config "../../tailwind.config.ts";
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  font-family: var(--font-sans, "Segoe UI"), system-ui, sans-serif;
+  background: #f8fafc;
+  color: #0f172a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+main {
+  margin: 0 auto;
+  max-width: 72rem;
+  padding: 3rem 1.5rem;
+}
+
+/*
+ * Dark portal shell (Modal.com-inspired). Applied by the partner portal and
+ * login layouts via `data-portal-shell`; the admin area keeps the light
+ * defaults above. Pages inside the shell manage their own spacing, so the
+ * global `main` constraint is lifted here.
+ */
+[data-portal-shell] {
+  color-scheme: dark;
+}
+
+[data-portal-shell] main {
+  margin: 0;
+  max-width: none;
+  padding: 0;
+}
+
+[data-portal-shell] ::selection {
+  background: rgba(128, 238, 100, 0.3);
+}
+
+[data-portal-shell] ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+[data-portal-shell] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+[data-portal-shell] ::-webkit-scrollbar-thumb {
+  background: #343a31;
+  border-radius: 6px;
+}
+
+[data-portal-shell] ::-webkit-scrollbar-thumb:hover {
+  background: #4a5245;
+}

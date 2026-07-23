@@ -1,0 +1,54 @@
+-- Administrator-only template. Run with psql while connected to kirimkode_partner.
+-- Supply: --set=partner_database=kirimkode_partner --set=partner_app_role=kirimkode_partner_app
+\set ON_ERROR_STOP on
+\if :{?partner_database}
+\else
+  \echo 'partner_database is required'; \quit
+\endif
+\if :{?partner_app_role}
+\else
+  \echo 'partner_app_role is required'; \quit
+\endif
+SELECT current_database() = :'partner_database'
+   AND :'partner_database' = 'kirimkode_partner'
+   AND :'partner_app_role' = 'kirimkode_partner_app' AS partner_setup_guard \gset
+\if :partner_setup_guard
+\else
+  \echo 'Refusing role setup outside the dedicated Partner database/role'; \quit
+\endif
+
+DO $partner_role$
+DECLARE can_create_role boolean;
+BEGIN
+  IF session_user = 'kirimkode_partner_app' OR NOT pg_has_role(current_user, 'pg_database_owner', 'MEMBER') THEN
+    RAISE EXCEPTION 'Partner database owner administrator is required';
+  END IF;
+  SELECT rolsuper OR rolcreaterole INTO can_create_role FROM pg_roles WHERE rolname = current_user;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'kirimkode_partner_app') THEN
+    IF NOT can_create_role THEN RAISE EXCEPTION 'CREATEROLE is required to create the Partner app role'; END IF;
+    CREATE ROLE kirimkode_partner_app LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+  END IF;
+END;
+$partner_role$;
+
+-- PostgreSQL privileges are additive: revoking a direct grant cannot override
+-- CONNECT inherited from PUBLIC. The Main database owner must first revoke
+-- PUBLIC CONNECT on kirimkode and grant it only to explicit Main roles.
+SELECT NOT EXISTS (
+  SELECT 1
+  FROM pg_database AS database_catalog
+  WHERE database_catalog.datname = 'kirimkode'
+    AND has_database_privilege(:'partner_app_role', database_catalog.oid, 'CONNECT')
+) AS partner_main_isolation_guard \gset
+\if :partner_main_isolation_guard
+\else
+  \echo 'Refusing setup: kirimkode_partner_app can CONNECT to Main database kirimkode'; \quit
+\endif
+
+REVOKE ALL ON DATABASE kirimkode_partner FROM PUBLIC;
+GRANT CONNECT ON DATABASE kirimkode_partner TO kirimkode_partner_app;
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+GRANT USAGE ON SCHEMA public TO kirimkode_partner_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO kirimkode_partner_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO kirimkode_partner_app;
+REVOKE UPDATE, DELETE ON TABLE order_snapshots, platform_configs, ledger_transactions, ledger_entries FROM kirimkode_partner_app;

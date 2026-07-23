@@ -1,0 +1,16 @@
+# Partner Platform dependencies and owned artifacts
+/node_modules/
+/.partner-next/
+/.partner-cache/
+/coverage/
+/src/generated/prisma/
+
+# Local Partner Platform runtime configuration
+.env
+.env.*
+!.env.example
+
+# Tooling
+*.log
+.DS_Store
+.vercel/
