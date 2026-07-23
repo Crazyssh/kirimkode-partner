@@ -44,6 +44,15 @@ export interface ReconciliationSnapshot {
 export interface ReconciliationAllocation {
   readonly earningId: string;
   readonly amountIdr: number;
+  /**
+   * True once the owning payout was rejected/failed and the allocation was
+   * released (kept for audit but no longer a live claim on the Earning). A
+   * released allocation is excluded from the at-most-one-active-allocation-per-
+   * Earning uniqueness check, but still counts toward the payout=Σallocations
+   * check (the DB financial-consistency trigger sums released rows too). Absent
+   * or false means an active allocation.
+   */
+  readonly released?: boolean;
 }
 
 export interface ReconciliationPayout {
@@ -215,11 +224,19 @@ export function reconcile(input: ReconciliationInput): ReconciliationReport {
     for (const payout of input.payouts) {
       let allocationTotal = 0;
       for (const allocation of payout.allocations) {
+        // The payout=Σallocations check sums EVERY row (released or not), to
+        // match the DB financial-consistency trigger which does the same.
         allocationTotal += allocation.amountIdr;
-        allocationCount.set(
-          allocation.earningId,
-          (allocationCount.get(allocation.earningId) ?? 0) + 1,
-        );
+        // The at-most-one-allocation-per-Earning check counts only ACTIVE rows:
+        // a released allocation (from a rejected/failed payout) legitimately
+        // coexists with a fresh active allocation for the same re-requested
+        // Earning, so counting it would raise a false duplicate finding.
+        if (!allocation.released) {
+          allocationCount.set(
+            allocation.earningId,
+            (allocationCount.get(allocation.earningId) ?? 0) + 1,
+          );
+        }
       }
       if (allocationTotal !== payout.amountIdr) {
         issues.push({

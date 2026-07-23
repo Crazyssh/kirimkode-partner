@@ -335,7 +335,7 @@ describe("reconciliation detector", () => {
     expect(report.issues.map((i) => i.type)).toContain("payout_allocation_mismatch");
   });
 
-  it("detects an earning allocated to more than one payout", () => {
+  it("detects an earning allocated to more than one ACTIVE payout", () => {
     const report = reconcile({
       payouts: [
         { id: "p-1", amountIdr: 1000, allocations: [{ earningId: "earn-1", amountIdr: 1000 }] },
@@ -344,6 +344,34 @@ describe("reconciliation detector", () => {
     });
     expect(report.issues.map((i) => i.type)).toContain(
       "duplicate_allocation_for_earning",
+    );
+  });
+
+  it("does not flag a re-requested earning whose earlier allocation was released", () => {
+    // A payout was rejected/failed (its allocation released, kept for audit) and
+    // the returned-to-available earning was requested again in a fresh payout.
+    // Two allocation rows exist for earn-1 but only one is active — legal.
+    const report = reconcile({
+      payouts: [
+        {
+          id: "p-rejected",
+          amountIdr: 1000,
+          allocations: [{ earningId: "earn-1", amountIdr: 1000, released: true }],
+        },
+        {
+          id: "p-active",
+          amountIdr: 1000,
+          allocations: [{ earningId: "earn-1", amountIdr: 1000, released: false }],
+        },
+      ],
+    });
+    expect(report.issues.map((i) => i.type)).not.toContain(
+      "duplicate_allocation_for_earning",
+    );
+    // The payout=Σallocations check still includes the released row, so neither
+    // payout is falsely reported as an amount mismatch.
+    expect(report.issues.map((i) => i.type)).not.toContain(
+      "payout_allocation_mismatch",
     );
   });
 

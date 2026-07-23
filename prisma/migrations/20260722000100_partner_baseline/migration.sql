@@ -889,6 +889,10 @@ CREATE UNIQUE INDEX "partner_payouts_id_partnerId_key" ON "partner_payouts"("id"
 -- returned-to-available Earning can be requested again without being stranded.
 CREATE UNIQUE INDEX "payout_allocations_earningId_key" ON "payout_allocations"("earningId") WHERE "releasedAt" IS NULL;
 
+-- Plain lookup index over ALL allocation rows (including released ones), for the
+-- earningId FK checks and released-row lookups the partial unique cannot serve.
+CREATE INDEX "payout_allocations_earningId_idx" ON "payout_allocations"("earningId");
+
 -- CreateIndex
 CREATE INDEX "payout_allocations_partnerId_payoutId_idx" ON "payout_allocations"("partnerId", "payoutId");
 
@@ -1153,9 +1157,20 @@ DECLARE target_id UUID; payout_status "PartnerPayoutStatus";
 BEGIN
   target_id := CASE WHEN TG_OP = 'DELETE' THEN OLD."payoutId" ELSE NEW."payoutId" END;
   SELECT "status" INTO payout_status FROM "partner_payouts" WHERE "id" = target_id;
-  -- While the payout is still `requested`, allocations are fully mutable.
+  -- While the payout is still `requested`, allocations are fully mutable —
+  -- EXCEPT releasedAt, which only the rejected/failed release path (below) may
+  -- set. Rejecting it here keeps a released row from ever escaping the partial
+  -- unique index while its payout is still live (defense-in-depth: no
+  -- application path does this, but the DB must not permit a second active
+  -- allocation for the same Earning via a smuggled releasedAt).
   IF payout_status = 'requested' THEN
     IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+    IF TG_OP = 'INSERT' AND NEW."releasedAt" IS NOT NULL THEN
+      RAISE EXCEPTION 'a requested payout allocation cannot be created already released';
+    END IF;
+    IF TG_OP = 'UPDATE' AND NEW."releasedAt" IS DISTINCT FROM OLD."releasedAt" THEN
+      RAISE EXCEPTION 'releasedAt can only be set when the payout is rejected/failed';
+    END IF;
     RETURN NEW;
   END IF;
   -- After `requested`, the ONLY permitted mutation is the one-way release of an

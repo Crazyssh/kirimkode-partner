@@ -1,4 +1,4 @@
-import { $Enums, type PrismaClient } from "@/generated/prisma";
+import { $Enums, Prisma, type PrismaClient } from "@/generated/prisma";
 
 import type {
   PartnerReconciliationState,
@@ -122,7 +122,15 @@ export class PrismaReconciliationGateway implements ReconciliationGateway {
   }
 
   async loadPartnerState(partnerId: string): Promise<PartnerReconciliationState> {
-    const [
+    // Read the entire partner snapshot inside ONE RepeatableRead transaction so
+    // every query observes the same MVCC snapshot. Without this, a concurrent
+    // commit between two of the reads (e.g. the earning-release cron moving an
+    // Earning pending->available plus its ledger event, landing between the
+    // ledger read and the earning read) makes the projection and the ledger
+    // disagree and mints a FALSE high-severity projection_ledger_mismatch issue.
+    // (The reads are still unbounded over full history — a rolling-checkpoint
+    // reconciliation is a separate scalability follow-up.)
+    const {
       ledgerRows,
       earningRows,
       snapshotRows,
@@ -130,46 +138,70 @@ export class PrismaReconciliationGateway implements ReconciliationGateway {
       numberRows,
       activeOrderRows,
       deviceRows,
-    ] = await Promise.all([
-      this.client.ledgerTransaction.findMany({
-        where: { partnerId },
-        select: {
-          eventType: true,
-          eventKey: true,
-          referenceType: true,
-          referenceId: true,
-          entries: { select: { bucket: true, amountIdrSigned: true } },
-        },
-      }),
-      this.client.partnerEarning.findMany({
-        where: { partnerId },
-        select: { id: true, orderId: true, amountIdr: true, status: true },
-      }),
-      this.client.orderSnapshot.findMany({
-        where: { order: { partnerId } },
-        select: { orderId: true, payoutIdr: true },
-      }),
-      this.client.partnerPayout.findMany({
-        where: { partnerId },
-        select: {
-          id: true,
-          amountIdr: true,
-          allocations: { select: { earningId: true, amountIdr: true } },
-        },
-      }),
-      this.client.partnerNumber.findMany({
-        where: { partnerId },
-        select: { id: true, status: true },
-      }),
-      this.client.partnerOrder.findMany({
-        where: { partnerId, status: { in: [...ACTIVE_ORDER_STATUSES] } },
-        select: { id: true, numberId: true, status: true },
-      }),
-      this.client.partnerDevice.findMany({
-        where: { partnerId },
-        select: { id: true, effectiveStatus: true, lastSeenAt: true },
-      }),
-    ]);
+    } = await this.client.$transaction(
+      async (tx) => {
+        const [
+          ledgerRows,
+          earningRows,
+          snapshotRows,
+          payoutRows,
+          numberRows,
+          activeOrderRows,
+          deviceRows,
+        ] = await Promise.all([
+          tx.ledgerTransaction.findMany({
+            where: { partnerId },
+            select: {
+              eventType: true,
+              eventKey: true,
+              referenceType: true,
+              referenceId: true,
+              entries: { select: { bucket: true, amountIdrSigned: true } },
+            },
+          }),
+          tx.partnerEarning.findMany({
+            where: { partnerId },
+            select: { id: true, orderId: true, amountIdr: true, status: true },
+          }),
+          tx.orderSnapshot.findMany({
+            where: { order: { partnerId } },
+            select: { orderId: true, payoutIdr: true },
+          }),
+          tx.partnerPayout.findMany({
+            where: { partnerId },
+            select: {
+              id: true,
+              amountIdr: true,
+              allocations: {
+                select: { earningId: true, amountIdr: true, releasedAt: true },
+              },
+            },
+          }),
+          tx.partnerNumber.findMany({
+            where: { partnerId },
+            select: { id: true, status: true },
+          }),
+          tx.partnerOrder.findMany({
+            where: { partnerId, status: { in: [...ACTIVE_ORDER_STATUSES] } },
+            select: { id: true, numberId: true, status: true },
+          }),
+          tx.partnerDevice.findMany({
+            where: { partnerId },
+            select: { id: true, effectiveStatus: true, lastSeenAt: true },
+          }),
+        ]);
+        return {
+          ledgerRows,
+          earningRows,
+          snapshotRows,
+          payoutRows,
+          numberRows,
+          activeOrderRows,
+          deviceRows,
+        };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+    );
 
     // Group active orders by the number they hold, for both the number-centric
     // checks and the order/number pairing check.
@@ -224,6 +256,9 @@ export class PrismaReconciliationGateway implements ReconciliationGateway {
         allocations: payout.allocations.map((allocation) => ({
           earningId: allocation.earningId,
           amountIdr: allocation.amountIdr,
+          // A released allocation (rejected/failed payout) is kept for audit but
+          // is not a live claim; the duplicate-per-Earning check must skip it.
+          released: allocation.releasedAt !== null,
         })),
       })),
       projectionBalances,
