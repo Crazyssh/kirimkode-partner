@@ -93,6 +93,12 @@ export interface ActiveOfferDimension {
 /** A number status change to persist together with its state-history entry. */
 export interface NumberStatusChange {
   readonly numberId: string;
+  /**
+   * The status the reconcile read before deciding `toStatus`. It is a
+   * compare-and-set guard: the write only lands while the number is still at
+   * `fromStatus`, so a number reserved/busied under a racing reservation is
+   * never overwritten by this best-effort recovery.
+   */
   readonly fromStatus: NumberStatus;
   readonly toStatus: NumberStatus;
   /** SHA-256-hashed actor reference (the device id) for the history row. */
@@ -118,8 +124,14 @@ export interface RecordHeartbeatTransaction {
   listIdleNumbers(deviceId: string): Promise<readonly IdleNumberRow[]>;
   /** Catalog dimensions the tenant currently has an active offer for. */
   listActiveOfferDimensions(): Promise<readonly ActiveOfferDimension[]>;
-  /** Apply a number status change and append its state-history row. */
-  applyNumberStatus(change: NumberStatusChange): Promise<void>;
+  /**
+   * Apply a number status change and append its state-history row. Returns
+   * `true` when the change was applied; `false` when the number had already
+   * moved off `fromStatus` (a concurrent writer won), in which case the write
+   * and its history row are skipped silently — this recovery is best-effort and
+   * must never overwrite reserved/busy state.
+   */
+  applyNumberStatus(change: NumberStatusChange): Promise<boolean>;
 }
 
 /**

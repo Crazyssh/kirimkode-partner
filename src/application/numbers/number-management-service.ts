@@ -35,6 +35,7 @@ import {
   type NumberStatus,
 } from "@domain/task-5-2-device-inventory-pricing";
 import { createAuditEvent, type AuditEventDescriptor } from "@domain/task-5-7";
+import { ConcurrencyConflictError } from "@infrastructure/database";
 
 import { checkPermission, type SessionContext } from "../authorization/session-context";
 import {
@@ -220,11 +221,23 @@ export class NumberManagementService {
       }
 
       const now = this.deps.clock.nowEpochMs();
-      const number = await tx.updateNumberStatus(input.numberId, {
-        status: nextStatus,
-        enabled: false,
-        activeCanonicalNumber: null,
-      });
+      let number: NumberView;
+      try {
+        number = await tx.updateNumberStatus(input.numberId, {
+          expectedStatus: existing.status,
+          status: nextStatus,
+          enabled: false,
+          activeCanonicalNumber: null,
+        });
+      } catch (error) {
+        // The number was reserved/busied between our read and write: the guard
+        // (requirement 7.4) now applies, so we report its fresh state rather than
+        // overwrite the concurrent reservation.
+        if (error instanceof ConcurrencyConflictError) {
+          return this.guardedByConcurrentChange(tx, input.numberId);
+        }
+        throw error;
+      }
 
       await this.recordStatusChange(tx, {
         caller: input.caller,
@@ -262,6 +275,7 @@ export class NumberManagementService {
       let number: NumberView;
       try {
         number = await tx.updateNumberStatus(input.numberId, {
+          expectedStatus: existing.status,
           status: nextStatus,
           enabled: true,
           activeCanonicalNumber: existing.canonicalNumber,
@@ -269,6 +283,12 @@ export class NumberManagementService {
       } catch (error) {
         if (error instanceof ActiveNumberConflictError) {
           return { ok: false, reason: "duplicate_active_number" } as const;
+        }
+        // The number stopped being `disabled` between our read and write (another
+        // request re-enabled it, or it was removed). Report it as no longer
+        // re-enable-able rather than overwrite the concurrent change.
+        if (error instanceof ConcurrencyConflictError) {
+          return { ok: false, reason: "validation", code: "NUMBER_NOT_DISABLED" } as const;
         }
         throw error;
       }
@@ -315,7 +335,18 @@ export class NumberManagementService {
       if (targetDevice === null) return { ok: false, reason: "device_not_found" } as const;
 
       const now = this.deps.clock.nowEpochMs();
-      const number = await tx.moveNumberDevice(input.numberId, input.targetDeviceId);
+      let number: NumberView;
+      try {
+        number = await tx.moveNumberDevice(input.numberId, input.targetDeviceId, existing.status);
+      } catch (error) {
+        // The number was reserved/busied between our read and the move: the guard
+        // (requirement 7.4) now applies, so we report its fresh state rather than
+        // re-home a number bound to an active order.
+        if (error instanceof ConcurrencyConflictError) {
+          return this.guardedByConcurrentChange(tx, input.numberId);
+        }
+        throw error;
+      }
 
       await this.writeAudit(tx, {
         caller: input.caller,
@@ -386,6 +417,22 @@ export class NumberManagementService {
 
       return { ok: true, number: existing } as const;
     });
+  }
+
+  /**
+   * Resolve a compare-and-set conflict on a status/device write. The number
+   * moved off the status the command decided against — typically a concurrent
+   * reservation flipped it `available -> reserved` — so we re-read its current
+   * state (tenant-scoped) and report it as guarded, never overwriting the newer
+   * state. A row deleted under us collapses to `not_found`.
+   */
+  private async guardedByConcurrentChange(
+    tx: NumberManagementTransaction,
+    numberId: string,
+  ): Promise<NumberCommandOutcome> {
+    const current = await tx.findNumberById(numberId);
+    if (current === null) return { ok: false, reason: "not_found" };
+    return { ok: false, reason: "state_guarded", status: current.status };
   }
 
   /** `manage_inventory` gate shared by every number command (requirement 4.4). */

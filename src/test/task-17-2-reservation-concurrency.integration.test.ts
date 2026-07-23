@@ -21,6 +21,7 @@ import {
   PrismaIdempotencyStore,
   PrismaIdempotencyTransactionRunner,
   PrismaReservationGateway,
+  RESERVE_LOCK_LIMIT,
   type PartnerDatabaseClient,
   type PartnerTransactionClient,
 } from "@infrastructure/database";
@@ -236,6 +237,55 @@ async function seedEligibleSupply(
   return { partnerId, deviceId, offerId, numberId, canonicalNumber };
 }
 
+/**
+ * A process-wide monotonic serial guarantees a globally unique canonical number
+ * for every seeded row, satisfying the `activeCanonicalNumber` UNIQUE constraint
+ * (and the "active mirrors canonical" CHECK) even across bulk seeds.
+ */
+let canonicalSerial = 0;
+function nextUniqueCanonicalNumber(): string {
+  canonicalSerial += 1;
+  // "+628" + [1-9] + 10 digits: valid Indonesian E.164 shape, <= 20 chars.
+  return `+6281${String(canonicalSerial).padStart(10, "0")}`;
+}
+
+interface BulkSupply {
+  readonly partnerId: string;
+  readonly numberIds: readonly string[];
+}
+
+/**
+ * Approved partner + online device + active offer + `count` `available` numbers,
+ * all eligible for reservation in the MVP dimension. Used to prove that a
+ * bounded lock batch leaves stock for concurrent reserves: with many eligible
+ * numbers, parallel reserves must each win a distinct number instead of one
+ * receiving a spurious stockout because a peer locked the whole dimension.
+ */
+async function seedManyEligibleNumbers(
+  client: PartnerDatabaseClient,
+  count: number,
+): Promise<BulkSupply> {
+  const partnerId = await createApprovedPartner(client);
+  const deviceId = await createOnlineDevice(client, partnerId, { online: true });
+  await createActiveOffer(client, partnerId);
+  const rows = Array.from({ length: count }, () => {
+    const canonicalNumber = nextUniqueCanonicalNumber();
+    return {
+      id: randomUUID(),
+      partnerId,
+      deviceId,
+      canonicalNumber,
+      activeCanonicalNumber: canonicalNumber,
+      countryCode: "ID",
+      operatorCode: "any",
+      status: "AVAILABLE" as const,
+      enabled: true,
+    };
+  });
+  await client.partnerNumber.createMany({ data: rows });
+  return { partnerId, numberIds: rows.map((row) => row.id) };
+}
+
 function reserveCommand(overrides: Partial<ReserveCommandInput> = {}): ReserveCommandInput {
   const suffix = randomUUID();
   return {
@@ -294,13 +344,22 @@ describe.runIf(hasPostgres)("Reservation concurrency integration (task 17.2)", (
         Array.from({ length: CONCURRENCY }, () => service.reserve(reserveCommand())),
       );
 
-      // Exactly one reservation succeeds; the rest are deterministic stockouts.
+      // Exactly one reservation succeeds. Each loser is a clean, non-partial
+      // failure that is EITHER a definitive stockout (409 — the winner had
+      // already committed the number busy before the loser looked) OR a
+      // retryable contention (503 DEPENDENCY_UNAVAILABLE — the number was still
+      // committed-`available` but row-locked by the winner, so the reserve
+      // rolled back for the caller to retry). Both are correct; the bug this
+      // guards against is a permanently-persisted stockout while the number was
+      // merely locked.
       const successes = results.filter(isSuccess);
-      const stockouts = results.filter((r) => errorCode(r) === "OUT_OF_STOCK");
+      const losers = results.filter((r) => !isSuccess(r));
       expect(successes).toHaveLength(1);
-      expect(stockouts).toHaveLength(CONCURRENCY - 1);
-      // No other outcome leaked in (e.g. a spurious contention/dependency error).
-      expect(successes.length + stockouts.length).toBe(CONCURRENCY);
+      expect(losers).toHaveLength(CONCURRENCY - 1);
+      for (const loser of losers) {
+        expect([409, 503]).toContain(loser.statusCode);
+        expect(["OUT_OF_STOCK", "DEPENDENCY_UNAVAILABLE"]).toContain(errorCode(loser));
+      }
 
       const winner = successes[0];
       if (!("data" in winner.body)) throw new Error("unreachable");
@@ -341,18 +400,33 @@ describe.runIf(hasPostgres)("Reservation concurrency integration (task 17.2)", (
       expect(view.snapshot.retailPriceIdr).toBe(snapshot.retailPriceIdr);
       expect(view.snapshot.payoutIdr).toBe(snapshot.payoutIdr);
 
-      // No partial idempotency rows: every reserve record committed COMPLETED,
-      // with exactly one 200 (the winner) and the rest 409 stockouts.
+      // No partial idempotency rows. The winner commits exactly one COMPLETED
+      // 200 record. A 409 loser (definitive stockout) also persists a COMPLETED
+      // record; a 503 loser (contention) threw and rolled back, persisting
+      // NOTHING (safe to retry). So: exactly one 200, no 503 ever persisted,
+      // every persisted record COMPLETED, and the row count is the winner plus
+      // only the definitive-stockout losers.
       const records = await client.idempotencyRecord.findMany({ where: { scope: RESERVE_SCOPE } });
-      expect(records).toHaveLength(CONCURRENCY);
       expect(records.every((rec) => rec.state === "COMPLETED")).toBe(true);
       expect(records.filter((rec) => rec.responseStatus === 200)).toHaveLength(1);
-      expect(records.filter((rec) => rec.responseStatus === 409)).toHaveLength(CONCURRENCY - 1);
+      expect(records.filter((rec) => rec.responseStatus === 503)).toHaveLength(0);
+      const definitiveStockoutLosers = losers.filter((r) => r.statusCode === 409);
+      expect(records).toHaveLength(1 + definitiveStockoutLosers.length);
 
       // The activation transition trail exists for exactly the one order.
       const transitions = await client.orderTransition.findMany({ where: { orderId: order.id } });
       const toStatuses = transitions.map((t) => t.toStatus).sort();
       expect(toStatuses).toEqual(["RESERVED", "WAITING_SMS"]);
+
+      // Contention is transient, never a permanent poison: once the winner has
+      // committed, a fresh retry of any loser resolves to a clean, definitive
+      // stockout (the single number is now busy).
+      for (const loser of losers) {
+        if (loser.statusCode !== 503) continue;
+        const retried = await service.reserve(reserveCommand());
+        expect(retried.statusCode).toBe(409);
+        expect(errorCode(retried)).toBe("OUT_OF_STOCK");
+      }
     });
   });
 
@@ -415,6 +489,169 @@ describe.runIf(hasPostgres)("Reservation concurrency integration (task 17.2)", (
       expect(another.statusCode).toBe(409);
       expect(errorCode(another)).toBe("OUT_OF_STOCK");
       expect(await client.partnerOrder.count({ where: { numberId: supply.numberId } })).toBe(1);
+    });
+  });
+
+  // Requirement 9.3 (contention safety, the other direction): with MORE than one
+  // eligible number, concurrent reservations must NOT starve each other. The
+  // candidate lock is bounded to a batch (RESERVE_LOCK_LIMIT), so a reserve
+  // locks only a slice of the available rows and leaves the rest for peers to
+  // lock via SKIP LOCKED. Two parallel reserves therefore both win, on distinct
+  // numbers — regressing this to an unbounded `FOR UPDATE SKIP LOCKED` (one
+  // reserve locking the entire dimension) would give one winner and one spurious
+  // OUT_OF_STOCK.
+  describe("Concurrent reserves against abundant stock each win a distinct number", () => {
+    it("resolves two parallel reserves as two successes on different numbers", async () => {
+      // More rows than one reserve can lock, so a peer always has stock left.
+      const supply = await seedManyEligibleNumbers(client, RESERVE_LOCK_LIMIT + 4);
+
+      const [a, b] = await Promise.all([
+        service.reserve(reserveCommand()),
+        service.reserve(reserveCommand()),
+      ]);
+
+      expect(isSuccess(a)).toBe(true);
+      expect(isSuccess(b)).toBe(true);
+      if (!("data" in a.body) || !("data" in b.body)) throw new Error("unreachable");
+
+      // Each reservation won a *different* number and produced a distinct order.
+      expect(a.body.data.number).not.toBe(b.body.data.number);
+      expect(a.body.data.partnerOrderId).not.toBe(b.body.data.partnerOrderId);
+
+      // Both winners came from the seeded supply and are BUSY, bound to their own
+      // order (available -> reserved -> busy committed atomically).
+      for (const view of [a.body.data, b.body.data]) {
+        const order = await client.partnerOrder.findUniqueOrThrow({
+          where: { id: view.partnerOrderId },
+        });
+        expect(order.status).toBe("WAITING_SMS");
+        expect(supply.numberIds).toContain(order.numberId);
+        const number = await client.partnerNumber.findUniqueOrThrow({
+          where: { id: order.numberId },
+        });
+        expect(number.status).toBe("BUSY");
+        expect(number.currentOrderId).toBe(order.id);
+      }
+    });
+  });
+
+  // Requirement 9.4 (small-inventory regression): when a dimension holds FEWER
+  // available numbers than one reserve's lock batch (RESERVE_LOCK_LIMIT), a
+  // single reserve can row-lock the ENTIRE dimension, so a concurrent peer sees
+  // zero via SKIP LOCKED. That must be a RETRYABLE contention (503), never a
+  // permanent, persisted OUT_OF_STOCK — the stock exists, it is merely locked.
+  // Deterministically simulated by holding FOR UPDATE on every available row in
+  // a separate connection while a reserve runs.
+  describe("Small inventory fully locked yields retryable contention, not a false stockout", () => {
+    it("returns 503 (not 409) while every available number is locked, then sells after release", async () => {
+      const supply = await seedManyEligibleNumbers(client, 3); // < RESERVE_LOCK_LIMIT
+      const locker = createPartnerDatabaseClient({ databaseUrl: database.connectionString });
+      await locker.$connect();
+
+      let reserveWhileLocked: ReserveResult | undefined;
+      try {
+        // Hold a row lock on every available number in the dimension across the
+        // reserve below (interactive transaction on a SEPARATE connection, so
+        // the service's own transaction runs concurrently and hits SKIP LOCKED).
+        await locker.$transaction(
+          async (tx) => {
+            await tx.$queryRaw`
+              SELECT "id"
+              FROM "partner_numbers"
+              WHERE "status"::text = 'available'
+                AND "enabled" = true
+                AND "currentOrderId" IS NULL
+                AND "countryCode" = 'ID'
+                AND "operatorCode" = 'any'
+              FOR UPDATE
+            `;
+            reserveWhileLocked = await service.reserve(reserveCommand());
+          },
+          { timeout: 20_000 },
+        );
+      } finally {
+        await locker.$disconnect();
+      }
+
+      // Contended, not stocked out: retryable 503 with nothing persisted, so the
+      // caller can safely retry (the pre-fix bug returned a permanent 409 here).
+      expect(reserveWhileLocked?.statusCode).toBe(503);
+      expect(errorCode(reserveWhileLocked as ReserveResult)).toBe("DEPENDENCY_UNAVAILABLE");
+      expect(
+        await client.idempotencyRecord.count({ where: { scope: RESERVE_SCOPE } }),
+      ).toBe(0);
+      expect(await client.partnerOrder.count()).toBe(0);
+
+      // With the lock released the very same stock is sellable — no poison.
+      const retry = await service.reserve(reserveCommand());
+      expect(isSuccess(retry)).toBe(true);
+      if (!("data" in retry.body)) throw new Error("unreachable");
+      expect(supply.numberIds).toContain(
+        (await client.partnerOrder.findUniqueOrThrow({
+          where: { id: retry.body.data.partnerOrderId },
+        })).numberId,
+      );
+    });
+  });
+
+  // The deterministic core of the bound: an interactive transaction holds a lock
+  // batch open while a second reserve runs *provably concurrently* (a barrier,
+  // not a hopeful race). The held batch is capped at RESERVE_LOCK_LIMIT even
+  // though far more rows are available, so the concurrent reserve skips it and
+  // still wins. The pre-fix unbounded query would have locked every available
+  // row here, so this fails deterministically without the LIMIT.
+  describe("A held lock batch is bounded, leaving stock for a concurrent reserve", () => {
+    it(`locks at most ${RESERVE_LOCK_LIMIT} rows so a concurrent reserve still wins`, async () => {
+      await seedManyEligibleNumbers(client, RESERVE_LOCK_LIMIT + 4);
+      const gateway = new PrismaReservationGateway();
+
+      // Barrier: the holder transaction locks its batch, signals, then parks on
+      // `held` so its FOR UPDATE locks stay live while the concurrent reserve runs.
+      let releaseHold: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        releaseHold = resolve;
+      });
+      let signalLocked: () => void = () => {};
+      const lockedSignal = new Promise<void>((resolve) => {
+        signalLocked = resolve;
+      });
+      let heldLockedIds: readonly string[] = [];
+
+      const holdTxn = client.$transaction(
+        async (tx) => {
+          const batch = await gateway.lockEligibleCandidates(tx, MVP_FILTER);
+          heldLockedIds = batch.map((candidate) => candidate.numberId);
+          signalLocked();
+          await held;
+        },
+        { timeout: 30_000, maxWait: 10_000 },
+      );
+
+      try {
+        await lockedSignal;
+        // Bounded: the batch never exceeds RESERVE_LOCK_LIMIT even though more
+        // than that many rows are available (the pre-fix query would lock all).
+        expect(heldLockedIds).toHaveLength(RESERVE_LOCK_LIMIT);
+
+        // Concurrent reserve skips the held batch (SKIP LOCKED) and still wins.
+        const result = await service.reserve(reserveCommand());
+        expect(isSuccess(result)).toBe(true);
+        if (!("data" in result.body)) throw new Error("unreachable");
+
+        const order = await client.partnerOrder.findUniqueOrThrow({
+          where: { id: result.body.data.partnerOrderId },
+        });
+        // It won a number OUTSIDE the still-locked batch and bound it BUSY.
+        expect(heldLockedIds).not.toContain(order.numberId);
+        const number = await client.partnerNumber.findUniqueOrThrow({
+          where: { id: order.numberId },
+        });
+        expect(number.status).toBe("BUSY");
+        expect(number.currentOrderId).toBe(order.id);
+      } finally {
+        releaseHold();
+        await holdTxn;
+      }
     });
   });
 });

@@ -75,6 +75,14 @@ export interface NewNumberRecord {
 
 /** A status/enable mutation applied to an existing number. */
 export interface NumberStatusMutation {
+  /**
+   * The status the caller read before deciding this mutation. It is folded into
+   * the update predicate as a compare-and-set guard: if the number has since
+   * moved off it (e.g. a concurrent reservation flipped `available -> reserved`),
+   * the write matches no row and the adapter raises a concurrency conflict
+   * instead of clobbering the newer state (requirement 7.4).
+   */
+  readonly expectedStatus: NumberStatus;
   readonly status: NumberStatus;
   readonly enabled: boolean;
   readonly activeCanonicalNumber: string | null;
@@ -121,8 +129,12 @@ export interface NumberManagementTransaction {
    * re-activating a canonical number now held by another active number.
    */
   updateNumberStatus(id: string, mutation: NumberStatusMutation): Promise<NumberView>;
-  /** Re-home a number onto another device of the same tenant. */
-  moveNumberDevice(id: string, deviceId: string): Promise<NumberView>;
+  /**
+   * Re-home a number onto another device of the same tenant. `expectedStatus`
+   * is the status the caller read before the move; it is a compare-and-set guard
+   * so a number that was reserved/busied under us is never re-homed mid-order.
+   */
+  moveNumberDevice(id: string, deviceId: string, expectedStatus: NumberStatus): Promise<NumberView>;
   /** Hard-delete a number and its state history. */
   deleteNumberById(id: string): Promise<void>;
   appendStateHistory(record: NumberStateHistoryRecord): Promise<void>;

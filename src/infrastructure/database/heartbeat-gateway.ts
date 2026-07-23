@@ -187,11 +187,21 @@ class PrismaRecordHeartbeatTransaction implements RecordHeartbeatTransaction {
     }));
   }
 
-  async applyNumberStatus(change: NumberStatusChange): Promise<void> {
-    await this.tx.partnerNumber.updateMany({
-      where: scopedIdWhere(this.tenant, change.numberId),
+  async applyNumberStatus(change: NumberStatusChange): Promise<boolean> {
+    // Compare-and-set on the status the reconcile read: pinning
+    // `status = fromStatus` means a number that raced to another status (e.g.
+    // reserved by a concurrent order between the read and this write) matches
+    // zero rows. This recovery is best-effort, so a no-match is skipped silently
+    // — we never overwrite the newer state and write no history for a non-change.
+    const { count } = await this.tx.partnerNumber.updateMany({
+      where: {
+        ...scopedIdWhere(this.tenant, change.numberId),
+        status: NUMBER_STATUS_TO_DB[change.fromStatus],
+      },
       data: { status: NUMBER_STATUS_TO_DB[change.toStatus] },
     });
+    if (count === 0) return false;
+
     await this.tx.numberStateHistory.create({
       data: {
         id: change.historyId,
@@ -204,6 +214,7 @@ class PrismaRecordHeartbeatTransaction implements RecordHeartbeatTransaction {
         createdAt: new Date(change.occurredAtEpochMs),
       },
     });
+    return true;
   }
 }
 

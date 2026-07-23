@@ -53,6 +53,30 @@ const PARTNER_STATUS_FROM_DB = {
 } as const;
 
 /**
+ * How many available rows one reservation row-locks per attempt.
+ *
+ * The candidate lock uses a bounded batch, not `LIMIT 1`, on purpose:
+ *
+ *  - **Not unbounded.** Without a `LIMIT`, the first reservation locks *every*
+ *    available row in the dimension. A concurrent reservation running
+ *    `SKIP LOCKED` then sees zero rows and returns a spurious `OUT_OF_STOCK`
+ *    that the idempotency record persists permanently — even though eligible
+ *    stock exists. A bounded batch leaves rows for concurrent reservations to
+ *    lock, so genuine parallel supply resolves to parallel successes.
+ *  - **Not `LIMIT 1`.** The coarse SQL predicate (`available` + enabled +
+ *    unbound) is only an approximation; the full eligibility conjunction
+ *    (partner approved, device live + `sms`, offer active) is re-applied in the
+ *    pure domain *after* the lock. A row that is `available` in SQL can be stale
+ *    (its device just went offline), so `LIMIT 1` could lock exactly one
+ *    ineligible row and skip an eligible one behind it — another false stockout.
+ *    Locking a batch gives the JS eligibility filter enough candidates to find a
+ *    live one while still bounding the lock footprint.
+ *
+ * Exported so the concurrency integration test can seed above/around the batch.
+ */
+export const RESERVE_LOCK_LIMIT = 64;
+
+/**
  * Prisma-backed reservation persistence for Internal API v1 (task 9.3).
  *
  * Every method runs on the caller-provided transaction handle — the same
@@ -61,12 +85,15 @@ const PARTNER_STATUS_FROM_DB = {
  * (design section 3/4). Raw Prisma never leaves this adapter.
  *
  * Candidate selection uses `SELECT ... FOR UPDATE SKIP LOCKED` on the available
- * number rows of the requested dimension, ordered by `id ASC`. A concurrent
- * reservation skips any row this transaction has locked, so at most one
- * reservation can ever win a given number (requirement 9.3). The coarse
- * available/enabled/no-active-order predicate is applied in SQL; the full
- * eligibility conjunction (partner approved, device live + `sms`, offer active)
- * stays in the pure domain, so the selection rule lives in exactly one place.
+ * number rows of the requested dimension, ordered by `id ASC` and bounded to a
+ * batch of {@link RESERVE_LOCK_LIMIT}. A concurrent reservation skips any row
+ * this transaction has locked, so at most one reservation can ever win a given
+ * number (requirement 9.3); the bounded batch leaves rows for concurrent
+ * reservations to lock so parallel supply resolves to parallel successes rather
+ * than a spurious stockout. The coarse available/enabled/no-active-order
+ * predicate is applied in SQL; the full eligibility conjunction (partner
+ * approved, device live + `sms`, offer active) stays in the pure domain, so the
+ * selection rule lives in exactly one place.
  */
 export class PrismaReservationGateway
   implements ReservationGateway<PartnerTransactionClient>
@@ -116,7 +143,11 @@ export class PrismaReservationGateway
     // Row-lock the available candidates for this dimension. SKIP LOCKED lets a
     // concurrent reservation pass over rows this transaction already holds, so
     // no two reservations contend for the same number. Ordered by id ASC for a
-    // deterministic MVP selection.
+    // deterministic MVP selection. LIMIT bounds the lock to a batch so a
+    // concurrent reservation can lock a different batch (SKIP LOCKED) instead of
+    // finding every row taken and stocking out spuriously; the batch still holds
+    // enough rows for the JS eligibility filter to skip stale-but-`available`
+    // candidates (see RESERVE_LOCK_LIMIT).
     const locked = await tx.$queryRaw<{ id: string }[]>(Prisma.sql`
       SELECT "id"
       FROM "partner_numbers"
@@ -126,9 +157,36 @@ export class PrismaReservationGateway
         AND "countryCode" = ${filter.countryCode}
         AND "operatorCode" = ${filter.operatorCode}
       ORDER BY "id" ASC
+      LIMIT ${RESERVE_LOCK_LIMIT}
       FOR UPDATE SKIP LOCKED
     `);
-    if (locked.length === 0) return [];
+    if (locked.length === 0) {
+      // SKIP LOCKED returned nothing, which is ambiguous: either the dimension
+      // is genuinely out of stock, or every currently-available number is
+      // momentarily row-locked by a concurrent reservation. An unlocked read
+      // (plain SELECT, no FOR UPDATE) sees the committed `available` rows
+      // regardless of who holds a lock, so it tells the two cases apart. If any
+      // available row exists it is transient contention — throw so the whole
+      // reserve rolls back and the caller safely retries (a definitive
+      // OUT_OF_STOCK here would be a false, permanently-persisted stockout while
+      // stock still exists; the batch LIMIT means one reserve locking a slice
+      // could otherwise starve peers, especially when the dimension holds
+      // <= RESERVE_LOCK_LIMIT numbers). Only a genuinely empty dimension is a
+      // real stockout.
+      const [availability] = await tx.$queryRaw<{ present: boolean }[]>(Prisma.sql`
+        SELECT EXISTS (
+          SELECT 1
+          FROM "partner_numbers"
+          WHERE "status"::text = 'available'
+            AND "enabled" = true
+            AND "currentOrderId" IS NULL
+            AND "countryCode" = ${filter.countryCode}
+            AND "operatorCode" = ${filter.operatorCode}
+        ) AS present
+      `);
+      if (availability?.present) throw new ReservationContentionError();
+      return [];
+    }
     const lockedIds = locked.map((row) => row.id);
 
     // Active offers for the dimension, keyed by owning partner (MVP allows at

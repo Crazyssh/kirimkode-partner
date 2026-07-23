@@ -335,6 +335,13 @@ describe.runIf(hasPostgres)("SMS/OTP persistence integration (task 12.4)", () =>
       // The order stores the encrypted OTP with its key version + fingerprint.
       const order = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
       expect(order.status).toBe("SUCCESS");
+      // A success is a terminal disposition, so `applySuccess` itself stamps
+      // `terminalAt` (the waiting order was seeded without one) equal to
+      // `succeededAt`. The OTP retention job keys off `terminalAt`, so a missing
+      // stamp would strand the decrypted OTP past the 24h window (req 19.5).
+      expect(order.succeededAt).not.toBeNull();
+      expect(order.terminalAt).not.toBeNull();
+      expect(order.terminalAt?.getTime()).toBe(order.succeededAt?.getTime());
       expect(order.otpKeyVersion).toBe(CIPHER_KEY_VERSION);
       expect(order.otpFingerprint).toBe(cipher.fingerprint(OTP));
       const otpBytes = Buffer.from(order.otpCiphertext ?? Buffer.alloc(0));

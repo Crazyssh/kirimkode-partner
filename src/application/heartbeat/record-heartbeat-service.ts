@@ -199,7 +199,10 @@ export class RecordHeartbeatService {
 
       if (target === number.status) continue;
 
-      await tx.applyNumberStatus({
+      // Compare-and-set on the read status: if the number was reserved/busied
+      // under us since `listIdleNumbers`, the write is skipped (best-effort) and
+      // the concurrent state stands — never resurrected to available/offline.
+      const applied = await tx.applyNumberStatus({
         numberId: number.id,
         fromStatus: number.status,
         toStatus: target,
@@ -209,7 +212,7 @@ export class RecordHeartbeatService {
         occurredAtEpochMs: args.lastSeenAtEpochMs,
       });
 
-      if (target === "available") recovered.push(number.id);
+      if (applied && target === "available") recovered.push(number.id);
     }
 
     return recovered;

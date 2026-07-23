@@ -304,6 +304,25 @@ describe("OrderTransitionService.timeout", () => {
     // No write: the order was already terminal at the requested state.
     expect(gateway.applied).toHaveLength(0);
   });
+
+  it("replays a retry with the same key even when the observed instant moves (cron re-run)", async () => {
+    // The order-timeout cron keeps a constant Idempotency-Key per order but
+    // re-observes `now` on every run. The observed instant must NOT be part of
+    // the idempotency payload: a moving `observedAtEpochMs` under the same key
+    // must replay the first terminal result, never poison the key with a
+    // permanent IDEMPOTENCY_CONFLICT that would leave the order stuck forever.
+    const first = await service.timeout(timeoutInput({ observedAtEpochMs: NOW }));
+    const second = await service.timeout(
+      timeoutInput({ observedAtEpochMs: NOW + 5 * MINUTE }),
+    );
+
+    expect(first.statusCode).toBe(200);
+    expect(second.statusCode).toBe(200);
+    // Verbatim replay of the first result, not a 409 conflict.
+    expect(second).toEqual(first);
+    // The terminal effect ran exactly once despite the moving observed instant.
+    expect(gateway.applied).toHaveLength(1);
+  });
 });
 
 describe("OrderTransitionService.fail", () => {

@@ -61,7 +61,7 @@ export { PrismaOfferManagementGateway } from "./offer-management-gateway";
 export { PrismaInventoryQueryGateway } from "./inventory-query-gateway";
 export { PrismaDashboardQueryGateway } from "./dashboard-query-gateway";
 export { PrismaOperationalQueryGateway } from "./portal-operational-gateway";
-export { PrismaReservationGateway } from "./reservation-gateway";
+export { PrismaReservationGateway, RESERVE_LOCK_LIMIT } from "./reservation-gateway";
 export { PrismaOrderOperationsGateway } from "./order-operations-gateway";
 export { readActivePlatformConfig } from "./platform-config-reader";
 export { PrismaAuthIdentityGateway } from "./auth-identity-repository";

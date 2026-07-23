@@ -39,6 +39,7 @@ import { createAuditEvent } from "@domain/task-5-7";
 import { mapDomainError, type SafeError } from "@domain/task-5-3/safe-errors";
 import type { JsonValue } from "@domain/task-5-3/canonical-request-hash";
 import { IdempotencyEngine } from "@application/internal-api";
+import { ConcurrencyConflictError } from "@infrastructure/database";
 
 import { ActiveNumberConflictError, type Clock, type IdGenerator, type NumberView } from "./ports";
 import type { AgentNumberGateway, RequestedAvailability } from "./agent-ports";
@@ -330,7 +331,13 @@ export class AgentNumberService<Tx> {
     }
 
     const now = this.deps.clock.nowEpochMs();
-    let mutation: { status: NumberStatus; enabled: boolean; activeCanonicalNumber: string | null };
+    let mutation: {
+      status: NumberStatus;
+      enabled: boolean;
+      activeCanonicalNumber: string | null;
+      // The status read above; the compare-and-set basis for the write below.
+      expectedStatus: NumberStatus;
+    };
 
     if (input.requested === "disabled") {
       let nextStatus: NumberStatus;
@@ -340,7 +347,12 @@ export class AgentNumberService<Tx> {
         if (isStateGuard(error)) return effectError(STATE_CONFLICT);
         return effectError(validationError(domainErrorCode(error)));
       }
-      mutation = { status: nextStatus, enabled: false, activeCanonicalNumber: null };
+      mutation = {
+        status: nextStatus,
+        enabled: false,
+        activeCanonicalNumber: null,
+        expectedStatus: context.status,
+      };
     } else {
       // available/offline: ensure the number is enabled (re-enabling a disabled
       // number returns it to `offline` first), then let the domain resolve the
@@ -370,7 +382,12 @@ export class AgentNumberService<Tx> {
                 : { heartbeatTimeoutSeconds: this.heartbeatTimeoutSeconds }),
             });
 
-      mutation = { status: target, enabled: true, activeCanonicalNumber: context.canonicalNumber };
+      mutation = {
+        status: target,
+        enabled: true,
+        activeCanonicalNumber: context.canonicalNumber,
+        expectedStatus: context.status,
+      };
     }
 
     let number: NumberView;
@@ -383,6 +400,10 @@ export class AgentNumberService<Tx> {
       );
     } catch (error) {
       if (error instanceof ActiveNumberConflictError) return effectError(DUPLICATE_ACTIVE_NUMBER);
+      // The number was reserved/busied between the read and this write: the same
+      // guard as a reserved/busy number applies (requirement 7.4). We report the
+      // conflict rather than overwrite the concurrent reservation.
+      if (error instanceof ConcurrencyConflictError) return effectError(STATE_CONFLICT);
       throw error;
     }
 

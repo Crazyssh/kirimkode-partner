@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ConcurrencyConflictError } from "@infrastructure/database";
 import { IdempotencyEngine } from "@application/internal-api";
 import type {
   IdempotencyRecordInsert,
@@ -87,6 +88,12 @@ class FakeAgentNumberGateway implements AgentNumberGateway<FakeTx> {
   readonly numbers = new Map<string, StoredNumber>();
   historyCount = 0;
   auditCount = 0;
+  /**
+   * Optional hook fired inside `applyNumberStatus`, right before its
+   * compare-and-set check, to simulate a concurrent writer (e.g. a reservation)
+   * landing between the availability read and the write.
+   */
+  onBeforeApply: ((number: StoredNumber) => void) | undefined;
   private nextId = 1;
   private readonly options: Required<FakeGatewayOptions>;
 
@@ -165,10 +172,23 @@ class FakeAgentNumberGateway implements AgentNumberGateway<FakeTx> {
     _tx: FakeTx,
     _partnerId: string,
     numberId: string,
-    mutation: { readonly status: NumberStatus; readonly enabled: boolean; readonly activeCanonicalNumber: string | null },
+    mutation: {
+      readonly status: NumberStatus;
+      readonly enabled: boolean;
+      readonly activeCanonicalNumber: string | null;
+      readonly expectedStatus: NumberStatus;
+    },
   ): Promise<NumberView> {
+    // Simulate a concurrent writer landing between the read and this write, then
+    // evaluate the compare-and-set against the resulting current state.
+    const raced = this.numbers.get(numberId);
+    if (raced !== undefined) this.onBeforeApply?.(raced);
     const n = this.numbers.get(numberId);
     if (n === undefined) throw new Error("number not found");
+    // Compare-and-set: a row that moved off the expected status matches nothing,
+    // which the real adapter surfaces as a concurrency conflict rather than
+    // clobbering the newer (reserved/busy) state.
+    if (n.status !== mutation.expectedStatus) throw new ConcurrencyConflictError();
     if (
       mutation.activeCanonicalNumber !== null &&
       [...this.numbers.values()].some(
@@ -438,5 +458,28 @@ describe("AgentNumberService.setAvailability", () => {
     // Device not live, so the effective state is offline, not available.
     expect(stored?.status).toBe("offline");
     expect(stored?.activeCanonicalNumber).toBe("+6281234567890");
+  });
+
+  // Requirement 7.4 (concurrency): a reservation that flips the number
+  // `offline -> reserved` between the availability read and the write must win.
+  // The compare-and-set matches no row, so the write is a STATE_CONFLICT and the
+  // reservation is never overwritten (Bug 1).
+  it("guards an availability write when the number is reserved between the read and write", async () => {
+    const gateway = new FakeAgentNumberGateway();
+    seedNumber(gateway, { status: "offline" });
+    gateway.onBeforeApply = (n) => {
+      n.status = "reserved";
+    };
+
+    const result = await makeService(gateway).setAvailability(
+      availabilityInput({ requested: "disabled" }),
+    );
+
+    expect(result.statusCode).toBe(409);
+    expect("error" in result.body && result.body.error.code).toBe("STATE_CONFLICT");
+    // The reservation stands: the availability write never overwrote it and no
+    // state-history entry was recorded for the write that did not land.
+    expect(gateway.numbers.get("num-1")?.status).toBe("reserved");
+    expect(gateway.historyCount).toBe(0);
   });
 });

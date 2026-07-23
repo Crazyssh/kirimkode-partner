@@ -532,6 +532,42 @@ describe.runIf(hasPostgres)("Order lifecycle and crash recovery integration (tas
     });
   });
 
+  // Requirements 12.5, 20.5: the order-timeout cron keeps a constant
+  // Idempotency-Key per order but re-observes `now` on every ~1-minute run. The
+  // observed instant must not be part of the idempotency payload, or the second
+  // run under a moved clock would collide on the key with a different request
+  // hash and be rejected as IDEMPOTENCY_CONFLICT forever — the order could never
+  // be timed out. This proves the re-run replays the first terminal result.
+  describe("A cron timeout re-run under a moved clock replays, never poisons the key", () => {
+    it("replays a same-key timeout whose observed instant moved on a later run", async () => {
+      const supply = await seedSupply(client);
+      const orderId = await seedWaitingOrder(client, supply, { expiresInPast: true });
+      const key = randomUUID();
+      const firstObservedAt = Date.now();
+
+      const first = await services.transition.timeout(
+        timeoutInput(orderId, firstObservedAt, { idempotencyKey: key }),
+      );
+      expect(first.statusCode).toBe(200);
+      expect(terminalData(first).status).toBe("timeout");
+
+      // The next cron run: SAME key, later observed instant. This must replay
+      // the first result verbatim, not surface an IDEMPOTENCY_CONFLICT.
+      const rerun = await services.transition.timeout(
+        timeoutInput(orderId, firstObservedAt + 60_000, { idempotencyKey: key }),
+      );
+      expect(rerun.statusCode).toBe(200);
+      expect(rerun).toEqual(first);
+
+      // The terminal effect and its number release each happened exactly once.
+      const order = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.status).toBe("TIMEOUT");
+      expect(order.version).toBe(2); // a single timeout write, not two
+      const transitions = await client.orderTransition.count({ where: { orderId } });
+      expect(transitions).toBe(1);
+    });
+  });
+
   // Requirements 12.2, 20.2: a crash between the reserve commit and activation
   // strands an order in `reserved`. The reservation-recovery job promotes a
   // still-valid one to `waiting_sms`/`busy`; re-running it (process restart)

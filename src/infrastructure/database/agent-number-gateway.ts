@@ -205,15 +205,24 @@ export class PrismaAgentNumberGateway
   ): Promise<NumberView> {
     const tenant = createTenantContext(partnerId);
     try {
+      // Compare-and-set on the status the caller read: pinning
+      // `status = expectedStatus` means a number reserved/busied by a concurrent
+      // order between the read and this write matches zero rows, so an
+      // availability change never overwrites the newer state.
       const { count } = await tx.partnerNumber.updateMany({
-        where: scopedIdWhere(tenant, numberId),
+        where: {
+          ...scopedIdWhere(tenant, numberId),
+          status: NUMBER_STATUS_TO_DB[mutation.expectedStatus],
+        },
         data: {
           status: NUMBER_STATUS_TO_DB[mutation.status],
           enabled: mutation.enabled,
           activeCanonicalNumber: mutation.activeCanonicalNumber,
         },
       });
-      assertAffectedExactlyOne(count, { compareAndSet: false });
+      // The caller read the row inside this transaction, so zero rows means it
+      // moved off `expectedStatus` under us — a retryable conflict.
+      assertAffectedExactlyOne(count, { compareAndSet: true });
     } catch (error) {
       if (isUniqueViolation(error)) throw new ActiveNumberConflictError();
       throw error;

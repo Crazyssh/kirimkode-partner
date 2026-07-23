@@ -231,6 +231,12 @@ export class PrismaPartnerSmsMatchingGateway
         otpKeyVersion: input.otpKeyVersion,
         otpFingerprint: input.otpFingerprint,
         succeededAt: now,
+        // A success is a terminal disposition, so stamp `terminalAt` here the
+        // same way `applyTerminalTransition` does for cancel/timeout/fail. The
+        // OTP retention job filters terminal orders by `terminalAt <= cutoff`;
+        // without this stamp a SUCCESS order would never match and its OTP would
+        // persist decrypted past the 24h window (requirement 19.5).
+        terminalAt: now,
         version: { increment: 1 },
       },
     });

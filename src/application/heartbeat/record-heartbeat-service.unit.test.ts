@@ -66,6 +66,12 @@ class FakeGateway implements HeartbeatGateway {
   readonly samples: HeartbeatSampleRecord[] = [];
   readonly deviceUpdates: HeartbeatDeviceUpdate[] = [];
   readonly numberChanges: NumberStatusChange[] = [];
+  /**
+   * Optional hook fired inside `applyNumberStatus`, right before its
+   * compare-and-set check, to simulate a concurrent writer (e.g. a reservation)
+   * landing between `listIdleNumbers` and the recovery write.
+   */
+  raceBefore: ((number: StoredNumber | undefined) => void) | undefined;
 
   constructor(device: HeartbeatDeviceRow | null) {
     this.device = device;
@@ -85,6 +91,7 @@ class FakeGateway implements HeartbeatGateway {
     const samples = this.samples;
     const deviceUpdates = this.deviceUpdates;
     const numberChanges = this.numberChanges;
+    const raceBefore = this.raceBefore;
     const belongsToTenant = tenant.partnerId === PARTNER_A;
     const tx: RecordHeartbeatTransaction = {
       async findDeviceForHeartbeat(deviceId: string): Promise<HeartbeatDeviceRow | null> {
@@ -125,10 +132,18 @@ class FakeGateway implements HeartbeatGateway {
       async listActiveOfferDimensions(): Promise<readonly ActiveOfferDimension[]> {
         return offerDimensions;
       },
-      async applyNumberStatus(change: NumberStatusChange): Promise<void> {
-        numberChanges.push(change);
+      async applyNumberStatus(change: NumberStatusChange): Promise<boolean> {
+        // Simulate a concurrent writer landing between the read and this write,
+        // then evaluate the compare-and-set against the resulting current state.
+        raceBefore?.(numbers.get(change.numberId));
         const number = numbers.get(change.numberId);
-        if (number) number.status = change.toStatus;
+        // Compare-and-set on the read status: a number that moved off it (e.g.
+        // reserved under us) matches nothing, so the write and its history row
+        // are skipped silently — the concurrent state is never overwritten.
+        if (!number || number.status !== change.fromStatus) return false;
+        number.status = change.toStatus;
+        numberChanges.push(change);
+        return true;
       },
     };
     return work(tx);
@@ -387,5 +402,42 @@ describe("RecordHeartbeatService", () => {
     expect(gateway.numberChanges).toEqual([
       expect.objectContaining({ numberId: "num-1", toStatus: "disabled" }),
     ]);
+  });
+
+  // Requirement 6.3 (concurrency): a reservation that flips an idle number
+  // `available -> reserved` between `listIdleNumbers` and the reconcile write
+  // must win. The compare-and-set matches no row, so the recovery is skipped
+  // silently — the reservation is never overwritten and no history is written
+  // (Bug 1).
+  it("skips a reconcile write when the number is reserved between the read and the write", async () => {
+    // No active offer -> an available number reconciles down to offline, so the
+    // reconcile attempts a write we can race.
+    gateway.offerDimensions = [];
+    gateway.seedNumber({
+      id: "num-1",
+      status: "available",
+      enabled: true,
+      countryCode: "ID",
+      operatorCode: "any",
+      hasActiveOrder: false,
+    });
+    gateway.raceBefore = (n) => {
+      if (n) n.status = "reserved";
+    };
+
+    const result = await service.recordHeartbeat({
+      tenant: TENANT,
+      deviceId: DEVICE_ID,
+      receivedAtServer: new Date(NOW),
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The write matched no row (status moved to reserved): skipped silently, no
+    // history entry, and the number is not reported as recovered.
+    expect(result.recoveredNumberIds).toEqual([]);
+    expect(gateway.numberChanges).toHaveLength(0);
+    // The reservation stands — never overwritten back to offline.
+    expect(gateway.numbers.get("num-1")?.status).toBe("reserved");
   });
 });

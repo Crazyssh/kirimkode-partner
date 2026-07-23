@@ -161,9 +161,17 @@ export class OrderTransitionService<Tx> {
 
   /** `POST /orders/{id}/timeout`: time an order out at the observed instant. */
   async timeout(input: TimeoutCommandInput): Promise<TerminalResult> {
+    // The idempotency payload is the *logical identity* of "time order X out",
+    // which must not depend on the instant it was observed. The order-timeout
+    // cron mints a constant Idempotency-Key per order (`buildJobOperationKey`)
+    // but re-observes `now` on every ~1-minute run; binding `observedAt` into
+    // the request hash would make each run a different payload under the same
+    // key and poison the key with a permanent IDEMPOTENCY_CONFLICT, so the
+    // order could never be timed out. The observed instant still drives the
+    // expiry decision and release context via `buildCommand` below — it is
+    // simply not part of the operation's identity.
     const payload: JsonValue = {
       orderId: input.orderId,
-      observedAt: input.observedAtEpochMs,
       reason: input.reason,
     };
     return this.runTerminal({

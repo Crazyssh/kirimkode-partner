@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { AuthenticatedPrincipal } from "@domain/task-7-2";
+import { ConcurrencyConflictError } from "@infrastructure/database";
 
 import { toSessionContext, type SessionContext } from "../authorization/session-context";
 import { NumberManagementService } from "./number-management-service";
@@ -70,6 +71,12 @@ class FakeGateway implements NumberManagementGateway {
   ]);
   readonly history: NumberStateHistoryRecord[] = [];
   readonly audits: AuditWriteInput[] = [];
+  /**
+   * Optional hook fired inside a status/device mutation, right before its
+   * compare-and-set check, to simulate a concurrent writer (e.g. a reservation)
+   * landing between the service's read and its write.
+   */
+  raceBefore: ((number: StoredNumber | undefined) => void) | undefined;
 
   seedNumber(number: StoredNumber): void {
     this.numbers.set(number.id, { ...number });
@@ -84,6 +91,7 @@ class FakeGateway implements NumberManagementGateway {
     const devices = this.devices;
     const history = this.history;
     const audits = this.audits;
+    const raceBefore = this.raceBefore;
 
     /** Enforce the MVP-global unique active-canonical slot across all tenants. */
     const assertGlobalUnique = (activeCanonical: string | null, selfId: string): void => {
@@ -127,17 +135,37 @@ class FakeGateway implements NumberManagementGateway {
         return toView(stored);
       },
       async updateNumberStatus(id: string, mutation: NumberStatusMutation): Promise<NumberView> {
+        // Simulate a concurrent writer landing between the read and this write,
+        // then evaluate the compare-and-set against the resulting current state
+        // (matching the real adapter's `updateMany` predicate).
+        raceBefore?.(numbers.get(id));
         const existing = numbers.get(id);
-        if (!existing || existing.partnerId !== partnerId) throw new Error("not found");
+        // Compare-and-set: a row that moved off the expected status (or vanished)
+        // matches nothing, which the real adapter surfaces as a concurrency
+        // conflict rather than clobbering the newer state.
+        if (
+          !existing ||
+          existing.partnerId !== partnerId ||
+          existing.status !== mutation.expectedStatus
+        ) {
+          throw new ConcurrencyConflictError();
+        }
         assertGlobalUnique(mutation.activeCanonicalNumber, id);
         existing.status = mutation.status;
         existing.enabled = mutation.enabled;
         existing.activeCanonicalNumber = mutation.activeCanonicalNumber;
         return toView(existing);
       },
-      async moveNumberDevice(id: string, deviceId: string): Promise<NumberView> {
+      async moveNumberDevice(
+        id: string,
+        deviceId: string,
+        expectedStatus: NumberStatus,
+      ): Promise<NumberView> {
+        raceBefore?.(numbers.get(id));
         const existing = numbers.get(id);
-        if (!existing || existing.partnerId !== partnerId) throw new Error("not found");
+        if (!existing || existing.partnerId !== partnerId || existing.status !== expectedStatus) {
+          throw new ConcurrencyConflictError();
+        }
         existing.deviceId = deviceId;
         return toView(existing);
       },
@@ -446,5 +474,95 @@ describe("NumberManagementService", () => {
       requestId: REQUEST_ID,
     });
     expect(result).toEqual({ ok: false, reason: "not_found" });
+  });
+
+  // Requirement 7.4 (concurrency): a reservation that flips the number
+  // `available -> reserved` between the service's read and its write must win —
+  // the disable's compare-and-set matches no row, so the reservation is never
+  // overwritten and the caller is told the number is now guarded.
+  describe("compare-and-set under a racing reservation (Bug 1)", () => {
+    const NUMBER_ID = "00000000-0000-4000-8000-0000000000f1";
+
+    it("does not overwrite a number reserved between the disable read and write", async () => {
+      gateway.seedNumber(storedNumber({ status: "available" }));
+      gateway.raceBefore = (n) => {
+        if (n) n.status = "reserved";
+      };
+
+      const result = await service.disableNumber({
+        caller: context(),
+        numberId: NUMBER_ID,
+        requestId: REQUEST_ID,
+      });
+
+      expect(result).toEqual({ ok: false, reason: "state_guarded", status: "reserved" });
+      const stored = gateway.numbers.get(NUMBER_ID);
+      // The reservation stands: status is not clobbered to disabled and the
+      // enabled flag / active slot are untouched.
+      expect(stored?.status).toBe("reserved");
+      expect(stored?.enabled).toBe(true);
+      expect(stored?.activeCanonicalNumber).toBe(CANONICAL);
+      // No history/audit was written for the write that never landed.
+      expect(gateway.history).toHaveLength(0);
+    });
+
+    it("does not re-home a number reserved between the move read and write", async () => {
+      gateway.seedNumber(storedNumber({ status: "offline" }));
+      gateway.raceBefore = (n) => {
+        if (n) n.status = "reserved";
+      };
+
+      const result = await service.moveNumberToDevice({
+        caller: context(),
+        numberId: NUMBER_ID,
+        targetDeviceId: DEVICE_A2,
+        requestId: REQUEST_ID,
+      });
+
+      expect(result).toEqual({ ok: false, reason: "state_guarded", status: "reserved" });
+      const stored = gateway.numbers.get(NUMBER_ID);
+      // The number was not re-homed and the reservation stands.
+      expect(stored?.deviceId).toBe(DEVICE_A);
+      expect(stored?.status).toBe("reserved");
+    });
+
+    it("reports a re-enable race as NUMBER_NOT_DISABLED without overwriting", async () => {
+      gateway.seedNumber(
+        storedNumber({ status: "disabled", enabled: false, activeCanonicalNumber: null }),
+      );
+      // The number is concurrently re-enabled (disabled -> offline) before our write.
+      gateway.raceBefore = (n) => {
+        if (n) {
+          n.status = "offline";
+          n.enabled = true;
+        }
+      };
+
+      const result = await service.reEnableNumber({
+        caller: context(),
+        numberId: NUMBER_ID,
+        requestId: REQUEST_ID,
+      });
+
+      expect(result).toEqual({ ok: false, reason: "validation", code: "NUMBER_NOT_DISABLED" });
+      // The concurrent re-enable stands; we did not re-run the transition on top.
+      expect(gateway.numbers.get(NUMBER_ID)?.status).toBe("offline");
+    });
+
+    it("maps a concurrent delete during disable to not_found", async () => {
+      gateway.seedNumber(storedNumber({ status: "available" }));
+      // The number is deleted out from under the disable between read and write.
+      gateway.raceBefore = () => {
+        gateway.numbers.delete(NUMBER_ID);
+      };
+
+      const result = await service.disableNumber({
+        caller: context(),
+        numberId: NUMBER_ID,
+        requestId: REQUEST_ID,
+      });
+
+      expect(result).toEqual({ ok: false, reason: "not_found" });
+    });
   });
 });

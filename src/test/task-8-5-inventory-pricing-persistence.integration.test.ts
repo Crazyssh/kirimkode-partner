@@ -20,7 +20,9 @@ import {
 import { toSessionContext, type SessionContext } from "@application/authorization/session-context";
 
 import {
+  ConcurrencyConflictError,
   createPartnerDatabaseClient,
+  createTenantContext,
   PrismaAgentDeviceCredentialGateway,
   PrismaDeviceManagementGateway,
   PrismaHeartbeatGateway,
@@ -600,6 +602,94 @@ describe.runIf(hasPostgres)("Inventory and pricing persistence integration (task
       // The number still exists.
       const still = await client.partnerNumber.findUnique({ where: { id: numberId } });
       expect(still).not.toBeNull();
+    });
+  });
+
+  // Requirement 7.4 (concurrency, Bug 1): a reservation that flips a number
+  // `available -> reserved` between a command's read and its write must win. The
+  // status write is a compare-and-set on the expected status, so a racing
+  // reservation is never overwritten. Proven on real Postgres by committing the
+  // reservation from a second connection mid-transaction.
+  describe("Number status compare-and-set under a racing reservation (Bug 1)", () => {
+    async function seedAvailableNumber() {
+      const { partnerId, caller, deviceId } = await seedPartnerWithDevice(services, client);
+      const registered = await services.numbers.registerNumber({
+        caller,
+        deviceId,
+        rawNumber: uniqueRawNumber(),
+        requestId: randomUUID(),
+      });
+      if (!registered.ok) throw new Error("number registration failed");
+      const numberId = registered.number.id;
+      // Bring the number to AVAILABLE, as a heartbeat recovery would.
+      await client.partnerNumber.update({ where: { id: numberId }, data: { status: "AVAILABLE" } });
+      return { partnerId, deviceId, numberId };
+    }
+
+    it("does not overwrite a number reserved between the disable read and write", async () => {
+      const { partnerId, numberId } = await seedAvailableNumber();
+      const gateway = new PrismaNumberManagementGateway(new PrismaUnitOfWork(client));
+      const tenant = createTenantContext(partnerId);
+
+      // A concurrent reservation commits `available -> reserved` (on a second
+      // connection) before the disable write. The compare-and-set matches no row.
+      await expect(
+        gateway.runInTenant(tenant, async (tx) => {
+          await client.partnerNumber.update({
+            where: { id: numberId },
+            data: { status: "RESERVED" },
+          });
+          return tx.updateNumberStatus(numberId, {
+            expectedStatus: "available",
+            status: "disabled",
+            enabled: false,
+            activeCanonicalNumber: null,
+          });
+        }),
+      ).rejects.toBeInstanceOf(ConcurrencyConflictError);
+
+      // The reservation stands: status is still RESERVED, the enable flag and the
+      // active-canonical slot are untouched, and no DISABLED history row landed.
+      const number = await client.partnerNumber.findUniqueOrThrow({ where: { id: numberId } });
+      expect(number.status).toBe("RESERVED");
+      expect(number.enabled).toBe(true);
+      expect(number.activeCanonicalNumber).not.toBeNull();
+      const history = await client.numberStateHistory.findMany({
+        where: { numberId, toStatus: "DISABLED" },
+      });
+      expect(history).toHaveLength(0);
+    });
+
+    it("skips a heartbeat reconcile write for a number reserved between the read and the write", async () => {
+      const { partnerId, deviceId, numberId } = await seedAvailableNumber();
+      const gateway = new PrismaHeartbeatGateway(new PrismaUnitOfWork(client));
+      const tenant = createTenantContext(partnerId);
+
+      const applied = await gateway.runInTenant(tenant, async (tx) => {
+        await client.partnerNumber.update({
+          where: { id: numberId },
+          data: { status: "RESERVED" },
+        });
+        return tx.applyNumberStatus({
+          numberId,
+          fromStatus: "available",
+          toStatus: "offline",
+          historyId: randomUUID(),
+          actorRef: deviceId,
+          reason: "heartbeat_recovery",
+          occurredAtEpochMs: services.clock.nowEpochMs(),
+        });
+      });
+
+      // Best-effort recovery: the write matched no row, so it was skipped silently
+      // without overwriting the reservation or writing a history row.
+      expect(applied).toBe(false);
+      const number = await client.partnerNumber.findUniqueOrThrow({ where: { id: numberId } });
+      expect(number.status).toBe("RESERVED");
+      const history = await client.numberStateHistory.findMany({
+        where: { numberId, reason: "heartbeat_recovery" },
+      });
+      expect(history).toHaveLength(0);
     });
   });
 

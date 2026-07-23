@@ -141,15 +141,24 @@ class PrismaNumberManagementTransaction implements NumberManagementTransaction {
 
   async updateNumberStatus(id: string, mutation: NumberStatusMutation): Promise<NumberView> {
     try {
+      // Compare-and-set on the status the caller decided against: pinning
+      // `status = expectedStatus` in the predicate means a number that raced to a
+      // new status (e.g. `available -> reserved` by a concurrent reservation)
+      // matches zero rows, so we never overwrite the newer state.
       const { count } = await this.tx.partnerNumber.updateMany({
-        where: scopedIdWhere(this.tenant, id),
+        where: {
+          ...scopedIdWhere(this.tenant, id),
+          status: NUMBER_STATUS_TO_DB[mutation.expectedStatus],
+        },
         data: {
           status: NUMBER_STATUS_TO_DB[mutation.status],
           enabled: mutation.enabled,
           activeCanonicalNumber: mutation.activeCanonicalNumber,
         },
       });
-      assertAffectedExactlyOne(count, { compareAndSet: false });
+      // The caller already read the row inside this transaction, so zero rows
+      // means it moved off `expectedStatus` under us — a retryable conflict.
+      assertAffectedExactlyOne(count, { compareAndSet: true });
     } catch (error) {
       if (isUniqueViolation(error)) throw new ActiveNumberConflictError();
       throw error;
@@ -157,12 +166,17 @@ class PrismaNumberManagementTransaction implements NumberManagementTransaction {
     return this.requireNumber(id);
   }
 
-  async moveNumberDevice(id: string, deviceId: string): Promise<NumberView> {
+  async moveNumberDevice(id: string, deviceId: string, expectedStatus: NumberStatus): Promise<NumberView> {
+    // Compare-and-set on the status read before the move so a number reserved or
+    // busied since then (requirement 7.4) is never re-homed mid-order.
     const { count } = await this.tx.partnerNumber.updateMany({
-      where: scopedIdWhere(this.tenant, id),
+      where: {
+        ...scopedIdWhere(this.tenant, id),
+        status: NUMBER_STATUS_TO_DB[expectedStatus],
+      },
       data: { deviceId },
     });
-    assertAffectedExactlyOne(count, { compareAndSet: false });
+    assertAffectedExactlyOne(count, { compareAndSet: true });
     return this.requireNumber(id);
   }
 

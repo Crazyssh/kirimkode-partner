@@ -17,6 +17,10 @@ import {
   ReconcileJob,
 } from "@application/cron-jobs";
 import { EarningLifecycleService } from "@application/ledger";
+import {
+  SmsIngestionService,
+  type IngestSmsInput,
+} from "@application/sms";
 
 import { buildJobOperationKey } from "@domain/task-16-1/cron-jobs";
 
@@ -28,6 +32,8 @@ import {
   PrismaJobLeaseRepository,
   PrismaLedgerRepository,
   PrismaOfflineSweepGateway,
+  PrismaPartnerSmsGateway,
+  PrismaPartnerSmsMatchingGateway,
   PrismaReconciliationGateway,
   PrismaReconciliationIssueRepository,
   PrismaReservationRecoveryGateway,
@@ -500,6 +506,64 @@ async function seedStuckReservation(
   return { partnerId, orderId, numberId };
 }
 
+/** Seed supply + a `waiting_sms` order whose window contains BASE, wired so the
+ * real SMS ingestion pipeline can drive it to SUCCESS. The number is BUSY and
+ * bound to the order via `currentOrderId`, satisfying the success
+ * compare-and-set precondition. Deliberately leaves `terminalAt` unset: the
+ * only writer of this order's terminal timestamp is `applySuccess`. */
+async function seedWaitingOrderForIngestion(client: PartnerDatabaseClient): Promise<{
+  partnerId: string;
+  deviceId: string;
+  numberId: string;
+  orderId: string;
+}> {
+  const partnerId = await createApprovedPartner(client);
+  const deviceId = await createDevice(client, partnerId, {
+    status: "ONLINE",
+    lastSeenAtEpochMs: BASE_EPOCH_MS,
+  });
+  const offerId = await createActiveOffer(client, partnerId);
+  const { numberId, canonicalNumber } = await createNumber(client, partnerId, deviceId, {
+    status: "BUSY",
+  });
+  const orderId = randomUUID();
+  await client.partnerOrder.create({
+    data: {
+      id: orderId,
+      buyerOrderRef: `buyer-${orderId}`,
+      buyerAccountRef: `acct-${randomUUID()}`,
+      partnerId,
+      numberId,
+      offerId,
+      status: "WAITING_SMS",
+      waitingAt: new Date(BASE_EPOCH_MS - 60_000),
+      reservedAt: new Date(BASE_EPOCH_MS - 120_000),
+      expiresAt: new Date(BASE_EPOCH_MS + 20 * 60_000),
+      version: 1,
+    },
+  });
+  await client.orderSnapshot.create({
+    data: {
+      orderId,
+      serviceCode: "wa",
+      countryCode: "ID",
+      operatorCode: "any",
+      canonicalNumber,
+      basePriceIdr: 1_000,
+      retailPriceIdr: 1_400,
+      payoutIdr: 1_000,
+      platformMarginIdr: 400,
+      currency: "IDR",
+      configVersion: 1,
+    },
+  });
+  await client.partnerNumber.update({
+    where: { id: numberId },
+    data: { currentOrderId: orderId, status: "BUSY" },
+  });
+  return { partnerId, deviceId, numberId, orderId };
+}
+
 // ---------------------------------------------------------------------------
 describe.runIf(hasPostgres)(
   "Jobs, retention, reconciliation persistence integration (task 16.6)",
@@ -933,6 +997,80 @@ describe.runIf(hasPostgres)(
 
         // Protected audit evidence is never removed by retention.
         expect(await client.auditEvent.findUnique({ where: { id: auditId } })).not.toBeNull();
+      });
+
+      it("redacts the OTP of a SUCCESS produced by applySuccess, whose terminalAt it stamps itself", async () => {
+        // The existing case above seeds `terminalAt` by hand, so it cannot prove
+        // that the production success path stamps it. Here a real
+        // `waiting_sms → success` runs through the ingestion pipeline (no manual
+        // `terminalAt`), then the OTP retention job must still redact it — which
+        // only happens if `applySuccess` set `terminalAt` for the retention
+        // filter to key off (requirement 19.5).
+        const clock = new MutableClock(BASE_EPOCH_MS);
+        const supply = await seedWaitingOrderForIngestion(client);
+
+        const ingestion = new SmsIngestionService<PartnerTransactionClient>({
+          runner: new PrismaIdempotencyTransactionRunner(client),
+          smsGateway: new PrismaPartnerSmsGateway(),
+          matchingGateway: new PrismaPartnerSmsMatchingGateway(),
+          cipher,
+          clock,
+          idGenerator,
+        });
+        const otp = "123456";
+        const input: IngestSmsInput = {
+          principal: { partnerId: supply.partnerId, deviceId: supply.deviceId },
+          numberId: supply.numberId,
+          messageId: randomUUID(),
+          idempotencyKey: randomUUID(),
+          sender: "WhatsAppBusiness",
+          body: `Your WhatsApp code is ${otp}`,
+          receivedAtDeviceEpochMs: BASE_EPOCH_MS - 2_000,
+        };
+
+        const result = await ingestion.ingest(input);
+        expect(result.status).toBe("matched");
+        if (result.status !== "matched") throw new Error("unreachable");
+        expect(result.orderId).toBe(supply.orderId);
+
+        // applySuccess stamped `terminalAt` itself (= succeededAt), with no
+        // manual seeding anywhere in this test.
+        const succeeded = await client.partnerOrder.findUniqueOrThrow({
+          where: { id: supply.orderId },
+        });
+        expect(succeeded.status).toBe("SUCCESS");
+        expect(succeeded.otpCiphertext).not.toBeNull();
+        expect(succeeded.succeededAt).not.toBeNull();
+        expect(succeeded.terminalAt).not.toBeNull();
+        expect(succeeded.terminalAt?.getTime()).toBe(succeeded.succeededAt?.getTime());
+
+        // Advance past the 24h OTP window and run the whole retention sweep.
+        clock.advance(25 * HOUR_MS);
+        const job = new RetentionRedactionJob({
+          gateway: new PrismaRetentionGateway(client),
+          clock,
+        });
+        await runToCompletion(makeRunner(client, clock), job);
+
+        // The OTP payload is redacted purely because applySuccess set
+        // `terminalAt`; the order, its Earning, and the ledger survive.
+        const redacted = await client.partnerOrder.findUniqueOrThrow({
+          where: { id: supply.orderId },
+        });
+        expect(redacted.otpCiphertext).toBeNull();
+        expect(redacted.otpKeyVersion).toBeNull();
+        expect(redacted.otpFingerprint).toBeNull();
+        expect(redacted.status).toBe("SUCCESS");
+        const earnings = await client.partnerEarning.findMany({
+          where: { orderId: supply.orderId },
+        });
+        expect(earnings).toHaveLength(1);
+        expect(earnings[0].status).toBe("PENDING");
+        expect(
+          await client.ledgerTransaction.count({
+            where: { eventKey: `order-success:${supply.orderId}` },
+          }),
+        ).toBe(1);
       });
     });
 
