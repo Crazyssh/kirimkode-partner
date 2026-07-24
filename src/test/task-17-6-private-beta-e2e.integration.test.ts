@@ -620,7 +620,7 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     // -------------------------------------------------------------------
     const destination = await services.destinations.createDestination({
       caller: supply.caller,
-      bankCode: "014",
+      bankCode: "BCA",
       accountNumber: "1234567890",
       accountHolderName: "Private Beta E2E Partner",
       requestId: randomUUID(),

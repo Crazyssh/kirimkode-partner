@@ -290,6 +290,10 @@ async function seedWaitingOrder(
       numberId: supply.numberId,
       offerId: supply.offerId,
       status: "WAITING_SMS",
+      // createdAt precedes expiresAt even when the order is already expired, so
+      // the partner_orders_expiry_check (expiresAt > createdAt) holds; the row
+      // is created 3 min in the past, before reservedAt.
+      createdAt: new Date(now - 180_000),
       reservedAt: new Date(now - 120_000),
       waitingAt: new Date(now - 60_000),
       expiresAt: new Date(options.expiresInPast ? now - 60_000 : now + 20 * 60_000),

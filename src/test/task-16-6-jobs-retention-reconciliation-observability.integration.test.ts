@@ -1195,7 +1195,7 @@ describe.runIf(hasPostgres)(
           data: {
             id: destinationId,
             partnerId,
-            bankCode: "014",
+            bankCode: "BCA",
             accountNumberCiphertext: Buffer.from([1, 2, 3, 4]),
             keyVersion: CIPHER_KEY_VERSION,
             accountNumberLast4: "1234",

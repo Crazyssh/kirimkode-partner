@@ -290,8 +290,10 @@ export class PrismaPartnerSmsMatchingGateway
         referenceType: input.ledger.referenceType,
         referenceId: input.ledger.referenceId,
         entries: {
+          // partnerId is derived from the parent transaction's composite
+          // relation (fields: [transactionId, partnerId]); passing it here is
+          // rejected by Prisma at runtime (see ledger-repository.appendTransaction).
           create: input.ledger.entries.map((entry) => ({
-            partnerId: input.partnerId,
             bucket: LEDGER_BUCKET_TO_DB[entry.bucket],
             amountIdrSigned: entry.amountIdrSigned,
           })),

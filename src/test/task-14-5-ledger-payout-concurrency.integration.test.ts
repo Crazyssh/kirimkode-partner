@@ -487,7 +487,7 @@ async function seedAvailableEarning(
 async function seedDestination(services: Services, tenant: Tenant): Promise<string> {
   const created = await services.destinations.createDestination({
     caller: tenant.caller,
-    bankCode: "014",
+    bankCode: "BCA",
     accountNumber: "1234567890",
     accountHolderName: "Ledger Payout Partner",
     requestId: randomUUID(),
