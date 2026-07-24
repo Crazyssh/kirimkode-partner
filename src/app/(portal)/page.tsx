@@ -15,6 +15,10 @@ import type { Metadata } from "next";
 
 import { getPortalServices } from "@application/portal";
 import { formatIdr } from "@domain/task-5-7";
+import {
+  computeSatisfaction,
+  type SatisfactionBand,
+} from "@domain/partner-economics";
 
 import { FeedbackBanner } from "./_components/feedback-banner";
 import { HeroBanner } from "./_components/hero-banner";
@@ -66,6 +70,27 @@ export default async function PartnerDashboardPage({
   const today = new Intl.DateTimeFormat("id-ID", { dateStyle: "long" }).format(
     new Date(),
   );
+
+  // Overall satisfaction (roadmap item 4): successfully-issued numbers over
+  // total requests, banded green/yellow/red. Undefined (null) until there is
+  // demand; guarded so a data anomaly (success > total) never throws the page.
+  const satisfaction =
+    view.orders.total > 0 && view.orders.success <= view.orders.total
+      ? computeSatisfaction({
+          successfullyIssued: view.orders.success,
+          totalRequests: view.orders.total,
+        })
+      : null;
+  const SATISFACTION_BAND_CLASS: Readonly<Record<SatisfactionBand, string>> = {
+    green: "text-brand",
+    yellow: "text-amber-300",
+    red: "text-red-300",
+  };
+  const SATISFACTION_BAND_LABEL: Readonly<Record<SatisfactionBand, string>> = {
+    green: "Sehat",
+    yellow: "Perlu dipantau",
+    red: "Rendah",
+  };
 
   return (
     <main>
@@ -120,6 +145,23 @@ export default async function PartnerDashboardPage({
               view.orders.total === 0
                 ? "Belum ada order. Order muncul saat buyer memesan nomor Anda."
                 : `Total ${view.orders.total} order • ${view.orders.success} sukses`
+            }
+          />
+          <StatCard
+            label="Kepuasan Permintaan"
+            value={
+              satisfaction ? (
+                <span className={SATISFACTION_BAND_CLASS[satisfaction.band]}>
+                  {satisfaction.percent}%
+                </span>
+              ) : (
+                <span className="text-ink-faint">—</span>
+              )
+            }
+            hint={
+              satisfaction
+                ? `${SATISFACTION_BAND_LABEL[satisfaction.band]} • ${view.orders.success} sukses dari ${view.orders.total} request`
+                : "Sukses ÷ total request. Muncul setelah ada order masuk."
             }
           />
           <StatCard
