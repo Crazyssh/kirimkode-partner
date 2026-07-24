@@ -908,6 +908,15 @@ describe.runIf(hasPostgres)("Inventory and pricing persistence integration (task
 
       const ordersBefore = await client.partnerOrder.count();
 
+      // This suite shares one database across the whole describe, and the buyer
+      // inventory query is platform-wide (not partner-scoped). Earlier heartbeat
+      // scenarios left online devices with fresh `lastSeenAt` in this same MVP
+      // dimension, which would still count as eligible supply at the base clock.
+      // Advance well past the 90s heartbeat freshness window so all residual
+      // supply is stale, leaving only THIS scenario's never-heartbeated (offline)
+      // device — a genuine platform-wide stockout.
+      services.clock.advance(30 * 60_000);
+
       const quote = await services.inventory.queryInventory({ filter: MVP_FILTER });
       expect(quote.ok).toBe(true);
       if (quote.ok) {

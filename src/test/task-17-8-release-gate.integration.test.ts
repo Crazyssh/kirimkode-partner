@@ -256,8 +256,15 @@ describe.runIf(hasPostgres)("Task 17.8 release-gate — seeded ledger + reconcil
       },
     });
 
-    // Bypass the repository's zero-sum guard to persist a leaking transaction
-    // (entries sum to -100) — the exact corruption the release-gate must catch.
+    // Bypass BOTH the repository's zero-sum guard and the database's balanced-
+    // ledger constraint triggers to persist a leaking transaction (entries sum
+    // to -100) — the exact corruption the release-gate must catch. The triggers
+    // are the production safety net that (correctly) rejects imbalanced ledgers;
+    // here we intentionally step around them with a superuser DISABLE TRIGGER so
+    // we can inject the very corruption the reconciler is meant to detect, then
+    // re-enable them immediately.
+    await client.$executeRawUnsafe('ALTER TABLE ledger_transactions DISABLE TRIGGER "ledger_transactions_balanced"');
+    await client.$executeRawUnsafe('ALTER TABLE ledger_entries DISABLE TRIGGER "ledger_entries_balanced"');
     const leakingTransaction = await client.ledgerTransaction.create({
       data: {
         partnerId,
@@ -273,6 +280,8 @@ describe.runIf(hasPostgres)("Task 17.8 release-gate — seeded ledger + reconcil
         { transactionId: leakingTransaction.id, partnerId, bucket: "PARTNER_PENDING", amountIdrSigned: 900 },
       ],
     });
+    await client.$executeRawUnsafe('ALTER TABLE ledger_transactions ENABLE TRIGGER "ledger_transactions_balanced"');
+    await client.$executeRawUnsafe('ALTER TABLE ledger_entries ENABLE TRIGGER "ledger_entries_balanced"');
 
     const gateway = new PrismaReconciliationGateway(client);
     const state = await gateway.loadPartnerState(partnerId);

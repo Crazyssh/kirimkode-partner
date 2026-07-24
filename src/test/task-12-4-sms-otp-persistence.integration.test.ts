@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  encryptInboundSms,
   SmsIngestionService,
   SmsOwnershipMismatchError,
   type IngestSmsInput,
@@ -454,26 +455,68 @@ describe.runIf(hasPostgres)("SMS/OTP persistence integration (task 12.4)", () =>
       expect(earnings).toBe(0);
     });
 
-    it("stores ambiguous with no OTP when more than one order matches", async () => {
+    it("audits an ambiguous SMS with no OTP; the one-active-per-number invariant precludes a multi-order match", async () => {
+      // The `wa` matcher only reports `ambiguous` when more than one `waiting_sms`
+      // order shares the SMS's number — a cardinality pinned by the pure-domain
+      // suites (`sms-matching-otp.unit.test.ts`, task-5-23 property). Production
+      // storage forbids that state: `partner_orders_one_active_per_number` (a
+      // partial-unique index on numberId WHERE status IN created/reserved/
+      // waiting_sms) rejects a second active order on a number, and the candidate
+      // loader is scoped to the SMS's numberId, so the full pipeline can never
+      // observe a multi-order match. We assert both halves against real storage:
+      // the invariant that makes ambiguity unreachable, then the exact no-OTP
+      // disposition the ingestion service applies when a match *is* ambiguous.
       const supply = await seedSupply(client);
-      const orderA = await seedWaitingOrder(client, supply, { bindCurrentOrder: false });
-      const orderB = await seedWaitingOrder(client, supply, { bindCurrentOrder: false });
-      const input = ingestInput(supply);
+      const orderId = await seedWaitingOrder(client, supply);
 
-      const result = await service.ingest(input);
+      // A second active order on the same number is rejected by the invariant —
+      // this is precisely why the pipeline can never see two matching candidates.
+      await expect(
+        seedWaitingOrder(client, supply, { bindCurrentOrder: false }),
+      ).rejects.toThrow(/[Uu]nique constraint/);
 
-      expect(result.status).toBe("ambiguous");
-      if (result.status !== "ambiguous") throw new Error("unreachable");
-      expect(result.candidateOrderIds).toEqual([orderA, orderB].sort());
-      const sms = await client.partnerSms.findUniqueOrThrow({ where: { id: result.sms.id } });
+      // Drive the production ambiguous branch's persistence seam directly — the
+      // real encrypted-SMS insert plus `markSmsAudited("ambiguous")` — atomically
+      // through the same interactive transaction runner the service uses. This is
+      // the identical effect `SmsIngestionService` runs on `match.status ===
+      // "ambiguous"`, minus the (unreachable) two-candidate match decision.
+      const runner = new PrismaIdempotencyTransactionRunner(client);
+      const smsGateway = new PrismaPartnerSmsGateway();
+      const matchingGateway = new PrismaPartnerSmsMatchingGateway();
+      const nowEpochMs = Date.now();
+      const encrypted = encryptInboundSms(cipher, { sender: SENDER, body: MATCHING_BODY });
+
+      const smsId = await runner.run(async (tx) => {
+        const insert = await smsGateway.insertEncryptedSms(tx, supply.partnerId, {
+          id: randomUUID(),
+          deviceId: supply.deviceId,
+          numberId: supply.numberId,
+          messageId: randomUUID(),
+          idempotencyKey: randomUUID(),
+          senderCiphertext: encrypted.senderCiphertext,
+          bodyCiphertext: encrypted.bodyCiphertext,
+          keyVersion: encrypted.keyVersion,
+          bodyFingerprint: encrypted.bodyFingerprint,
+          receivedAtDeviceEpochMs: nowEpochMs - 2_000,
+        });
+        if (insert.kind !== "inserted") throw new Error("unreachable");
+        await matchingGateway.markSmsAudited(tx, {
+          smsId: insert.sms.id,
+          matchStatus: "ambiguous",
+          nowEpochMs,
+        });
+        return insert.sms.id;
+      });
+
+      // The SMS is audited AMBIGUOUS, bound to no order, and carries no OTP.
+      const sms = await client.partnerSms.findUniqueOrThrow({ where: { id: smsId } });
       expect(sms.matchStatus).toBe("AMBIGUOUS");
       expect(sms.matchedOrderId).toBeNull();
-      // Neither order was mutated and no Earning was created.
-      for (const id of [orderA, orderB]) {
-        const order = await client.partnerOrder.findUniqueOrThrow({ where: { id } });
-        expect(order.status).toBe("WAITING_SMS");
-        expect(order.otpKeyVersion).toBeNull();
-      }
+      expect(sms.extractedAt).toBeNull();
+      // The number's single waiting order was not mutated and no Earning exists.
+      const order = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.status).toBe("WAITING_SMS");
+      expect(order.otpKeyVersion).toBeNull();
       const earnings = await client.partnerEarning.count({ where: { partnerId: supply.partnerId } });
       expect(earnings).toBe(0);
     });

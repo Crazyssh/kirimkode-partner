@@ -277,10 +277,16 @@ async function seedSnapshot(client: PartnerDatabaseClient, orderId: string, cano
 async function seedWaitingOrder(
   client: PartnerDatabaseClient,
   supply: Supply,
-  options: { readonly expiresInPast?: boolean } = {},
+  options: { readonly expiresInPast?: boolean; readonly createdAgoMs?: number } = {},
 ): Promise<string> {
   const orderId = randomUUID();
   const now = Date.now();
+  // How long ago the order was created. Defaults to 3 minutes so the lifecycle
+  // timestamps precede `expiresAt` even for an already-expired seed
+  // (partner_orders_expiry_check: expiresAt > createdAt). The cancel-minimum-age
+  // scenario overrides this with a genuinely fresh order (< cancelMinimumSeconds)
+  // so the cancel is legitimately "too early" (age = observedAt - createdAt).
+  const createdAgoMs = options.createdAgoMs ?? 180_000;
   await client.partnerOrder.create({
     data: {
       id: orderId,
@@ -290,12 +296,12 @@ async function seedWaitingOrder(
       numberId: supply.numberId,
       offerId: supply.offerId,
       status: "WAITING_SMS",
-      // createdAt precedes expiresAt even when the order is already expired, so
-      // the partner_orders_expiry_check (expiresAt > createdAt) holds; the row
-      // is created 3 min in the past, before reservedAt.
-      createdAt: new Date(now - 180_000),
-      reservedAt: new Date(now - 120_000),
-      waitingAt: new Date(now - 60_000),
+      // createdAt < reservedAt < waitingAt < now, and stays before expiresAt even
+      // when the order is already expired. The default (createdAgoMs = 180_000)
+      // reproduces the original 3 min / 2 min / 1 min lifecycle exactly.
+      createdAt: new Date(now - createdAgoMs),
+      reservedAt: new Date(now - Math.floor((createdAgoMs * 2) / 3)),
+      waitingAt: new Date(now - Math.floor(createdAgoMs / 3)),
       expiresAt: new Date(options.expiresInPast ? now - 60_000 : now + 20 * 60_000),
       version: 1,
     },
@@ -416,7 +422,9 @@ describe.runIf(hasPostgres)("Order lifecycle and crash recovery integration (tas
   describe("Cancel before the minimum age is rejected", () => {
     it("refuses a cancel younger than 3 minutes and leaves the order waiting", async () => {
       const supply = await seedSupply(client);
-      const orderId = await seedWaitingOrder(client, supply);
+      // A genuinely fresh order (created 30s ago, well under the 180s
+      // cancelMinimumSeconds) so the cancel is legitimately "too early".
+      const orderId = await seedWaitingOrder(client, supply, { createdAgoMs: 30_000 });
 
       const result = await services.transition.cancel(cancelInput(orderId));
 

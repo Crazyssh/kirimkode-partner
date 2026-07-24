@@ -506,11 +506,20 @@ async function seedStuckReservation(
   return { partnerId, orderId, numberId };
 }
 
-/** Seed supply + a `waiting_sms` order whose window contains BASE, wired so the
- * real SMS ingestion pipeline can drive it to SUCCESS. The number is BUSY and
- * bound to the order via `currentOrderId`, satisfying the success
- * compare-and-set precondition. Deliberately leaves `terminalAt` unset: the
- * only writer of this order's terminal timestamp is `applySuccess`. */
+/** Seed supply + a `waiting_sms` order whose match window contains the SMS's
+ * server-received instant, wired so the real SMS ingestion pipeline can drive it
+ * to SUCCESS. The number is BUSY and bound to the order via `currentOrderId`,
+ * satisfying the success compare-and-set precondition. Deliberately leaves
+ * `terminalAt` unset: the only writer of this order's terminal timestamp is
+ * `applySuccess`.
+ *
+ * The window is anchored on wall-clock `Date.now()`, NOT the fake `BASE_EPOCH_MS`
+ * clock: `partner_sms.receivedAtServer` is assigned by the database
+ * (`DEFAULT CURRENT_TIMESTAMP`), and matching compares that real instant against
+ * the order's `[waitingAt, expiresAt]` window. Under the fake clock the window
+ * would sit days in the future and never contain the real server instant, so the
+ * SMS would never match. `applySuccess` still stamps `succeededAt`/`terminalAt`
+ * from the injected fake clock, keeping the 24h OTP retention below deterministic. */
 async function seedWaitingOrderForIngestion(client: PartnerDatabaseClient): Promise<{
   partnerId: string;
   deviceId: string;
@@ -527,6 +536,9 @@ async function seedWaitingOrderForIngestion(client: PartnerDatabaseClient): Prom
     status: "BUSY",
   });
   const orderId = randomUUID();
+  // Anchor the match window on wall-clock time so the DB-assigned
+  // `receivedAtServer` (CURRENT_TIMESTAMP) falls inside it — see the doc above.
+  const wallNow = Date.now();
   await client.partnerOrder.create({
     data: {
       id: orderId,
@@ -536,9 +548,9 @@ async function seedWaitingOrderForIngestion(client: PartnerDatabaseClient): Prom
       numberId,
       offerId,
       status: "WAITING_SMS",
-      waitingAt: new Date(BASE_EPOCH_MS - 60_000),
-      reservedAt: new Date(BASE_EPOCH_MS - 120_000),
-      expiresAt: new Date(BASE_EPOCH_MS + 20 * 60_000),
+      waitingAt: new Date(wallNow - 60_000),
+      reservedAt: new Date(wallNow - 120_000),
+      expiresAt: new Date(wallNow + 20 * 60_000),
       version: 1,
     },
   });
@@ -799,7 +811,9 @@ describe.runIf(hasPostgres)(
         const partnerId = await createApprovedPartner(client);
         const deviceId = await createDevice(client, partnerId, { status: "ONLINE" });
         const offerId = await createActiveOffer(client, partnerId);
-        const { numberId } = await createNumber(client, partnerId, deviceId, { status: "AVAILABLE" });
+        const { numberId, canonicalNumber } = await createNumber(client, partnerId, deviceId, {
+          status: "AVAILABLE",
+        });
 
         // --- SMS: one past the 7d window (redact), one within it (retain). ---
         const smsBody = "WhatsApp code 314159 do not share";
@@ -851,6 +865,23 @@ describe.runIf(hasPostgres)(
               reservedAt: new Date(terminalAtEpochMs - HOUR_MS),
               succeededAt: new Date(terminalAtEpochMs),
               terminalAt: new Date(terminalAtEpochMs),
+            },
+          });
+          // A SUCCESS order always has an immutable snapshot; its payout must
+          // equal the paired Earning's amount (partner_earnings_match_snapshot).
+          await client.orderSnapshot.create({
+            data: {
+              orderId,
+              serviceCode: "wa",
+              countryCode: "ID",
+              operatorCode: "any",
+              canonicalNumber,
+              basePriceIdr: 1_000,
+              retailPriceIdr: 1_400,
+              payoutIdr: 1_000,
+              platformMarginIdr: 400,
+              currency: "IDR",
+              configVersion: 1,
             },
           });
           return orderId;
@@ -1116,6 +1147,15 @@ describe.runIf(hasPostgres)(
         });
 
         // (3) Non-zero-sum ledger transaction -> ledger_imbalance (+ global).
+        // The zero-sum triggers now correctly reject this (production is fixed),
+        // so disable them around ONLY this deliberate corruption to reproduce the
+        // imbalance the reconciler must detect; re-enable immediately after.
+        await client.$executeRawUnsafe(
+          'ALTER TABLE ledger_transactions DISABLE TRIGGER "ledger_transactions_balanced"',
+        );
+        await client.$executeRawUnsafe(
+          'ALTER TABLE ledger_entries DISABLE TRIGGER "ledger_entries_balanced"',
+        );
         await client.ledgerTransaction.create({
           data: {
             partnerId,
@@ -1126,6 +1166,12 @@ describe.runIf(hasPostgres)(
             entries: { create: [{ bucket: "PARTNER_PENDING", amountIdrSigned: 1_000 }] },
           },
         });
+        await client.$executeRawUnsafe(
+          'ALTER TABLE ledger_transactions ENABLE TRIGGER "ledger_transactions_balanced"',
+        );
+        await client.$executeRawUnsafe(
+          'ALTER TABLE ledger_entries ENABLE TRIGGER "ledger_entries_balanced"',
+        );
 
         // (4) Earning != order snapshot payout -> earning_snapshot_mismatch, and
         //     the pending earning projection drifts from the ledger buckets ->
@@ -1166,7 +1212,13 @@ describe.runIf(hasPostgres)(
             configVersion: 1,
           },
         });
+        // The snapshot-match trigger now correctly rejects an earning whose amount
+        // differs from the snapshot payout, so disable it around ONLY this
+        // deliberate drift the reconciler must detect; re-enable immediately after.
         const earningId = randomUUID();
+        await client.$executeRawUnsafe(
+          'ALTER TABLE partner_earnings DISABLE TRIGGER "partner_earnings_match_snapshot"',
+        );
         await client.partnerEarning.create({
           data: {
             id: earningId,
@@ -1177,6 +1229,9 @@ describe.runIf(hasPostgres)(
             availableAt: new Date(BASE_EPOCH_MS + DAY_MS),
           },
         });
+        await client.$executeRawUnsafe(
+          'ALTER TABLE partner_earnings ENABLE TRIGGER "partner_earnings_match_snapshot"',
+        );
 
         // (5) Payout amount != sum of its allocations -> payout_allocation_mismatch.
         const memberId = randomUUID();
@@ -1202,7 +1257,17 @@ describe.runIf(hasPostgres)(
             accountHolderName: "Test Holder",
           },
         });
+        // The payout financial-consistency triggers now correctly require the
+        // payout amount to equal its whole-earning allocations, so disable them
+        // around ONLY this deliberate mismatch the reconciler must detect;
+        // re-enable immediately after.
         const payoutId = randomUUID();
+        await client.$executeRawUnsafe(
+          'ALTER TABLE partner_payouts DISABLE TRIGGER "partner_payouts_financial_consistency"',
+        );
+        await client.$executeRawUnsafe(
+          'ALTER TABLE payout_allocations DISABLE TRIGGER "payout_allocations_financial_consistency"',
+        );
         await client.partnerPayout.create({
           data: {
             id: payoutId,
@@ -1217,6 +1282,12 @@ describe.runIf(hasPostgres)(
         await client.payoutAllocation.create({
           data: { id: randomUUID(), partnerId, payoutId, earningId, amountIdr: 1_000 },
         });
+        await client.$executeRawUnsafe(
+          'ALTER TABLE partner_payouts ENABLE TRIGGER "partner_payouts_financial_consistency"',
+        );
+        await client.$executeRawUnsafe(
+          'ALTER TABLE payout_allocations ENABLE TRIGGER "payout_allocations_financial_consistency"',
+        );
 
         return partnerId;
       }

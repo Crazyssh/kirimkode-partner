@@ -544,9 +544,28 @@ describe.runIf(hasPostgres)("Reservation concurrency integration (task 17.2)", (
   // a separate connection while a reserve runs.
   describe("Small inventory fully locked yields retryable contention, not a false stockout", () => {
     it("returns 503 (not 409) while every available number is locked, then sells after release", async () => {
+      // This suite shares one database across the whole describe and the reserve
+      // path selects platform-wide (not partner-scoped). Earlier scenarios leave
+      // residual `available` stock in this dimension (the abundant-stock test
+      // leaves rows unsold), which would violate this scenario's precondition — a
+      // SMALL dimension (< the lock batch) whose entire available supply is the
+      // rows seeded below. Disable that residual stock so only these three
+      // numbers are reservable, and the locker can hold the whole dimension.
+      await client.partnerNumber.updateMany({
+        where: { status: "AVAILABLE", enabled: true, countryCode: "ID", operatorCode: "any" },
+        data: { status: "OFFLINE" },
+      });
       const supply = await seedManyEligibleNumbers(client, 3); // < RESERVE_LOCK_LIMIT
       const locker = createPartnerDatabaseClient({ databaseUrl: database.connectionString });
       await locker.$connect();
+
+      // The suite database has accumulated idempotency records and orders from
+      // earlier scenarios; a contended 503 must persist NOTHING, so the reserve
+      // must leave both counts exactly where they started (a delta of zero).
+      const idempotencyBefore = await client.idempotencyRecord.count({
+        where: { scope: RESERVE_SCOPE },
+      });
+      const ordersBefore = await client.partnerOrder.count();
 
       let reserveWhileLocked: ReserveResult | undefined;
       try {
@@ -579,8 +598,8 @@ describe.runIf(hasPostgres)("Reservation concurrency integration (task 17.2)", (
       expect(errorCode(reserveWhileLocked as ReserveResult)).toBe("DEPENDENCY_UNAVAILABLE");
       expect(
         await client.idempotencyRecord.count({ where: { scope: RESERVE_SCOPE } }),
-      ).toBe(0);
-      expect(await client.partnerOrder.count()).toBe(0);
+      ).toBe(idempotencyBefore);
+      expect(await client.partnerOrder.count()).toBe(ordersBefore);
 
       // With the lock released the very same stock is sellable — no poison.
       const retry = await service.reserve(reserveCommand());
