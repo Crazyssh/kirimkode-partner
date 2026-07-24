@@ -51,7 +51,17 @@ jobs:
       - name: Pin npm to match the committed lockfile
         run: npm install -g npm@11
       - name: Install pinned Partner dependencies
-        run: npm ci
+        run: |
+          echo "node=$(node -v) npm=$(npm -v)"
+          set +e
+          npm ci --no-audit --no-fund > /tmp/npmci.log 2>&1
+          code=$?
+          echo "--- npm ci output (tail) ---"
+          tail -n 80 /tmp/npmci.log
+          if [ "$code" -ne 0 ]; then
+            echo "::error title=npm ci failed (npm $(npm -v))::$(tail -n 30 /tmp/npmci.log | tr '\n' '|' | sed 's/[[:cntrl:]]//g' | cut -c1-1600)"
+            exit "$code"
+          fi
       - name: Scan Partner migration SQL
         run: npm run migration:check
       - name: Lint Partner
