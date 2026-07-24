@@ -54,12 +54,13 @@ jobs:
         run: |
           echo "node=$(node -v) npm=$(npm -v)"
           set +e
-          npm ci --no-audit --no-fund > /tmp/npmci.log 2>&1
+          npm ci > /tmp/npmci.log 2>&1
           code=$?
-          echo "--- npm ci output (tail) ---"
-          tail -n 80 /tmp/npmci.log
+          echo "--- npm ci output (full) ---"
+          cat /tmp/npmci.log
           if [ "$code" -ne 0 ]; then
-            echo "::error title=npm ci failed (npm $(npm -v))::$(tail -n 30 /tmp/npmci.log | tr '\n' '|' | sed 's/[[:cntrl:]]//g' | cut -c1-1600)"
+            REASON=$(grep -iE 'npm (error|warn)' /tmp/npmci.log | grep -viE 'A complete log|for more info|npm help|^npm error$' | head -n 18 | tr '\n' '|' | sed 's/[[:cntrl:]]//g' | cut -c1-1600)
+            echo "::error title=npm ci failed (npm $(npm -v))::$REASON"
             exit "$code"
           fi
       - name: Scan Partner migration SQL
