@@ -1138,7 +1138,16 @@ CREATE CONSTRAINT TRIGGER partner_earnings_match_snapshot
 CREATE FUNCTION partner_check_ledger_balance() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE target_id UUID; entry_count INTEGER; signed_total BIGINT;
 BEGIN
-  target_id := CASE WHEN TG_TABLE_NAME = 'ledger_transactions' THEN NEW."id" ELSE NEW."transactionId" END;
+  -- IF/ELSE (not a single CASE expression): PL/pgSQL plans each assignment
+  -- lazily on first execution, so the branch that references a field the
+  -- current NEW record lacks is never type-resolved. A CASE here would resolve
+  -- BOTH NEW."id" and NEW."transactionId" together and fail on ledger_transactions
+  -- (which has no transactionId), breaking every ledger-transaction insert.
+  IF TG_TABLE_NAME = 'ledger_transactions' THEN
+    target_id := NEW."id";
+  ELSE
+    target_id := NEW."transactionId";
+  END IF;
   SELECT COUNT(*), COALESCE(SUM("amountIdrSigned"), 0)
     INTO entry_count, signed_total FROM "ledger_entries" WHERE "transactionId" = target_id;
   IF entry_count < 2 OR signed_total <> 0 THEN
@@ -1198,8 +1207,16 @@ CREATE TRIGGER payout_allocations_state_guard BEFORE INSERT OR UPDATE OR DELETE 
 CREATE FUNCTION partner_check_payout_financials() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE target_id UUID; payout_amount INTEGER; allocation_total BIGINT; invalid_allocations INTEGER;
 BEGIN
-  target_id := CASE WHEN TG_TABLE_NAME = 'partner_payouts' THEN NEW."id"
-                    WHEN TG_OP = 'DELETE' THEN OLD."payoutId" ELSE NEW."payoutId" END;
+  -- IF/ELSIF (not a single CASE): plans each branch lazily so partner_payouts
+  -- (no payoutId field) never type-resolves NEW/OLD."payoutId". A CASE would
+  -- resolve all three field refs together and fail on every partner_payouts write.
+  IF TG_TABLE_NAME = 'partner_payouts' THEN
+    target_id := NEW."id";
+  ELSIF TG_OP = 'DELETE' THEN
+    target_id := OLD."payoutId";
+  ELSE
+    target_id := NEW."payoutId";
+  END IF;
   SELECT "amountIdr" INTO payout_amount FROM "partner_payouts" WHERE "id" = target_id;
   SELECT COALESCE(SUM(a."amountIdr"), 0), COUNT(*) FILTER (WHERE a."amountIdr" <> e."amountIdr")
     INTO allocation_total, invalid_allocations

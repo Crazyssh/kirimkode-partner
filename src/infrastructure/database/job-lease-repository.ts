@@ -26,7 +26,7 @@ import type {
  *    the existing lease has expired or is already owned by the requester. The
  *    conditional `WHERE` runs inside the same statement, so two racing workers
  *    cannot both win — Postgres serializes the row update and the loser's
- *    `RETURNING` is empty. A takeover deliberately does not reset `cursor_json`,
+ *    `RETURNING` is empty. A takeover deliberately does not reset `"cursorJson"`,
  *    so work resumes where the crashed owner stopped.
  *  - `renew` extends the expiry (and optionally advances the cursor) only while
  *    the caller still owns an unexpired lease; a zero-row update means the lease
@@ -34,7 +34,7 @@ import type {
  *  - `release` expires the lease immediately, conditioned on ownership, so a
  *    worker never releases a lease another worker has taken over.
  *
- * The `cursor_json` column is `jsonb`; cursors are serialized with an explicit
+ * The `"cursorJson"` column is `jsonb`; cursors are serialized with an explicit
  * `::jsonb` cast (a `null` cursor stores SQL `NULL`), since raw-query parameters
  * are not implicitly coerced to json.
  */
@@ -56,15 +56,15 @@ export class PrismaJobLeaseRepository implements JobLeaseRepository {
     const now = new Date(input.nowEpochMs);
 
     const rows = await this.client.$queryRaw<LeaseRow[]>(Prisma.sql`
-      INSERT INTO job_leases (id, name, owner_id, lease_until, cursor_json, created_at, updated_at)
+      INSERT INTO job_leases (id, name, "ownerId", "leaseUntil", "cursorJson", "createdAt", "updatedAt")
       VALUES (${randomUUID()}::uuid, ${input.name}, ${input.ownerId}, ${leaseUntil}, NULL, now(), now())
       ON CONFLICT (name) DO UPDATE
-        SET owner_id = ${input.ownerId},
-            lease_until = ${leaseUntil},
-            updated_at = now()
-        WHERE job_leases.lease_until <= ${now}
-           OR job_leases.owner_id = ${input.ownerId}
-      RETURNING owner_id AS "ownerId", lease_until AS "leaseUntil", cursor_json AS "cursorJson"
+        SET "ownerId" = ${input.ownerId},
+            "leaseUntil" = ${leaseUntil},
+            "updatedAt" = now()
+        WHERE job_leases."leaseUntil" <= ${now}
+           OR job_leases."ownerId" = ${input.ownerId}
+      RETURNING "ownerId" AS "ownerId", "leaseUntil" AS "leaseUntil", "cursorJson" AS "cursorJson"
     `);
 
     const row = rows[0];
@@ -86,16 +86,16 @@ export class PrismaJobLeaseRepository implements JobLeaseRepository {
     // When the caller advances the cursor, write it in the same statement so a
     // crash after this point resumes from the advanced position.
     const cursorAssignment = "cursor" in input
-      ? Prisma.sql`, cursor_json = ${cursorSql(input.cursor ?? null)}`
+      ? Prisma.sql`, "cursorJson" = ${cursorSql(input.cursor ?? null)}`
       : Prisma.empty;
 
     const affected = await this.client.$executeRaw(Prisma.sql`
       UPDATE job_leases
-      SET lease_until = ${leaseUntil},
-          updated_at = now()${cursorAssignment}
+      SET "leaseUntil" = ${leaseUntil},
+          "updatedAt" = now()${cursorAssignment}
       WHERE name = ${input.name}
-        AND owner_id = ${input.ownerId}
-        AND lease_until > ${now}
+        AND "ownerId" = ${input.ownerId}
+        AND "leaseUntil" > ${now}
     `);
 
     return affected > 0;
@@ -106,16 +106,16 @@ export class PrismaJobLeaseRepository implements JobLeaseRepository {
     // but only while we still own it — never release another worker's lease.
     await this.client.$executeRaw(Prisma.sql`
       UPDATE job_leases
-      SET lease_until = to_timestamp(0),
-          updated_at = now()
+      SET "leaseUntil" = to_timestamp(0),
+          "updatedAt" = now()
       WHERE name = ${input.name}
-        AND owner_id = ${input.ownerId}
+        AND "ownerId" = ${input.ownerId}
     `);
   }
 }
 
 /**
- * Build the `cursor_json` value fragment. A `null` cursor clears the column to
+ * Build the `"cursorJson"` value fragment. A `null` cursor clears the column to
  * SQL `NULL`; any other cursor is serialized and cast to `jsonb`.
  */
 function cursorSql(cursor: JobCursor): Prisma.Sql {
