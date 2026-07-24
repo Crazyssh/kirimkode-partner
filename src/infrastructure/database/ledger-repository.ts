@@ -70,8 +70,12 @@ export class PrismaLedgerRepository
           referenceType: transaction.referenceType,
           referenceId: transaction.referenceId,
           entries: {
+            // partnerId is NOT set here: it is the relation scalar of the
+            // composite `transaction` relation (fields: [transactionId,
+            // partnerId]), so Prisma derives it from the parent transaction and
+            // rejects it as an explicit argument in this nested create. The
+            // entry's `partner` relation reuses the same derived scalar.
             create: transaction.entries.map((entry) => ({
-              partnerId,
               bucket: LEDGER_BUCKET_TO_DB[entry.bucket],
               amountIdrSigned: entry.amountIdrSigned,
             })),

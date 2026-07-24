@@ -46,7 +46,10 @@ function fakeExecutor(): {
       transactions.push({ id, eventKey: data.eventKey, partnerId: data.partnerId });
       const nested = data.entries as { create: Row[] };
       for (const entry of nested.create) {
-        entries.push({ ...entry });
+        // Entries inherit partnerId (and transactionId) from the parent
+        // transaction via the composite relation, exactly as the real Prisma
+        // client derives them — the nested create never carries partnerId.
+        entries.push({ ...entry, transactionId: id, partnerId: data.partnerId });
       }
       return { id };
     },
