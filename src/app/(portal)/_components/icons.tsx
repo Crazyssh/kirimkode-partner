@@ -169,3 +169,12 @@ export function IconInfo(props: IconProps) {
     </svg>
   );
 }
+
+export function IconDownload(props: IconProps) {
+  return (
+    <svg {...base(props)}>
+      <path d="M12 3v12M8 11l4 4 4-4" />
+      <path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2" />
+    </svg>
+  );
+}

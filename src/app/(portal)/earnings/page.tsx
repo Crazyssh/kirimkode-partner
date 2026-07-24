@@ -14,6 +14,7 @@ import { getPortalServices } from "@application/portal";
 import { formatIdr, formatJakartaTimestamp } from "@domain/task-5-7";
 
 import { EmptyState } from "../_components/empty-state";
+import { IconDownload } from "../_components/icons";
 import { PageHeader } from "../_components/page-header";
 import { Panel } from "../_components/panel";
 import { StatusPill, type PillTone } from "../_components/status-pill";
@@ -51,7 +52,17 @@ export default async function EarningsPage() {
       <PageHeader
         title="Earning"
         subtitle="Earning terbentuk saat order sukses dan tersedia setelah masa tahan."
-      />
+      >
+        {view.earnings.length > 0 ? (
+          <a
+            href="/earnings/export"
+            className="inline-flex items-center gap-2 rounded-lg border border-line-strong px-3.5 py-1.5 text-sm text-ink transition-colors hover:bg-white/5"
+          >
+            <IconDownload className="h-3.5 w-3.5" />
+            Ekspor CSV
+          </a>
+        ) : null}
+      </PageHeader>
 
       <section aria-label="Ringkasan earning" className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
         <StatCard
