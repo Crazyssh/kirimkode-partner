@@ -31,6 +31,10 @@ import {
   type OrderNumberTransitionDecision,
   type ReleaseDisposition,
 } from "@domain/order-state-machine";
+import {
+  decideListeningHoldRelease,
+  type ListeningReleaseTrigger,
+} from "@domain/order-listening-window";
 import { mapDomainError, type SafeError } from "@domain/task-5-3/safe-errors";
 import type { JsonValue } from "@domain/task-5-3/canonical-request-hash";
 import { IdempotencyEngine } from "@application/internal-api";
@@ -47,6 +51,7 @@ import {
 export const CANCEL_SCOPE = "orders.cancel";
 export const TIMEOUT_SCOPE = "orders.timeout";
 export const FAIL_SCOPE = "orders.fail";
+export const COMPLETE_SCOPE = "orders.complete";
 
 /** The cancel reason that permits pre-activation compensation by Main. */
 const MAIN_COMPENSATION = "MAIN_COMPENSATION";
@@ -104,6 +109,44 @@ export type TerminalResponseBody =
 export interface TerminalResult {
   readonly statusCode: number;
   readonly body: TerminalResponseBody;
+}
+
+/** `POST /orders/{id}/complete`: close a listening window and release the hold. */
+export interface CompleteCommandInput {
+  readonly orderId: string;
+  readonly principalId: string;
+  readonly idempotencyKey: string | null;
+  readonly method: string;
+  readonly path: string;
+  /** `buyer_complete` from Main; `expiry_sweep` from the completion sweep job. */
+  readonly trigger: ListeningReleaseTrigger;
+  readonly actorRef: string;
+  /**
+   * The instant the trigger observed. The sweep passes its batch `now` so the
+   * expiry check and the release disposition agree; buyer completion omits it and
+   * the server clock is used.
+   */
+  readonly observedAtEpochMs?: number;
+}
+
+/**
+ * The completion outcome. The order stays `success` — completion only closes the
+ * listening window and reports how the number was disposed.
+ */
+export type CompletedOrderView = {
+  readonly partnerOrderId: string;
+  readonly status: "success";
+  readonly completedAt: string;
+  readonly releaseDisposition: ReleaseDisposition | null;
+};
+
+export type CompleteResponseBody =
+  | { readonly data: CompletedOrderView }
+  | { readonly error: { readonly code: string; readonly message: string; readonly retryable: boolean } };
+
+export interface CompleteResult {
+  readonly statusCode: number;
+  readonly body: CompleteResponseBody;
 }
 
 const DEPENDENCY_UNAVAILABLE: SafeError = mapDomainError({ kind: "dependency_unavailable" });
@@ -221,6 +264,101 @@ export class OrderTransitionService<Tx> {
         release: this.releaseContext(ctx, config, nowEpochMs),
       }),
     });
+  }
+
+  /**
+   * `POST /orders/{id}/complete`: close a successful order's listening window and
+   * release its number hold.
+   *
+   * The order stays `success` — the money settled when its first OTP arrived, and
+   * completion moves none of it. Only the hold ends: `completedAt` is stamped and
+   * the number goes back to `available`/`offline` per the live device state. Two
+   * triggers share this path: the buyer finishing early, and the sweep closing an
+   * expired window; the pure {@link decideListeningHoldRelease} decides which is
+   * allowed. Completion is idempotent both ways — the idempotency engine replays a
+   * repeated request, and an already-released hold is reported as success without
+   * a write.
+   */
+  async complete(input: CompleteCommandInput): Promise<CompleteResult> {
+    const payload: JsonValue = { orderId: input.orderId, trigger: input.trigger };
+    try {
+      const outcome = await this.deps.idempotency.runIdempotent<CompleteResponseBody>({
+        scope: COMPLETE_SCOPE,
+        principalId: input.principalId,
+        idempotencyKey: input.idempotencyKey,
+        method: input.method,
+        path: input.path,
+        payload,
+        retention: "operational",
+        effect: (tx) => this.runCompleteEffect(tx, input),
+      });
+
+      switch (outcome.kind) {
+        case "executed":
+        case "replayed":
+          return { statusCode: outcome.statusCode, body: outcome.response as CompleteResponseBody };
+        case "rejected":
+          return outcome.code === "IDEMPOTENCY_REQUIRED"
+            ? completeError(mapDomainError({ kind: "idempotency_required" }))
+            : completeError(mapDomainError({ kind: "idempotency_conflict" }));
+      }
+    } catch (error) {
+      if (error instanceof TerminalTransitionContentionError) {
+        return completeError(mapDomainError({ kind: "state_conflict", retryableStateConflict: true }));
+      }
+      return completeError(DEPENDENCY_UNAVAILABLE);
+    }
+  }
+
+  private async runCompleteEffect(
+    tx: Tx,
+    input: CompleteCommandInput,
+  ): Promise<{ statusCode: number; response: CompleteResponseBody }> {
+    const config = await this.deps.gateway.loadActiveConfig(tx);
+    if (config === null) throw new DependencyUnavailableError();
+
+    const ctx = await this.deps.gateway.loadTransitionContext(tx, input.orderId);
+    if (ctx === null) return completeEffectError(NOT_FOUND);
+
+    const observedAtMs = input.observedAtEpochMs ?? this.deps.clock.nowEpochMs();
+    const decision = decideListeningHoldRelease({
+      order: {
+        orderId: ctx.orderId,
+        orderStatus: ctx.orderStatus,
+        completedAtMs: ctx.completedAtEpochMs,
+        expiresAtMs: ctx.expiresAtEpochMs,
+      },
+      numberStatus: ctx.numberStatus,
+      numberCurrentOrderId: ctx.numberCurrentOrderId,
+      trigger: input.trigger,
+      observedAtMs,
+      release: this.releaseContext(ctx, config, observedAtMs),
+    });
+
+    if (decision.kind === "no_change") {
+      // The hold was already released. Report the original completion instant so
+      // a late buyer request and the sweep agree on one answer.
+      return completeSuccess(ctx.orderId, ctx.completedAtEpochMs ?? observedAtMs, null);
+    }
+    if (decision.kind === "reject") {
+      return completeEffectError(mapDomainError({ kind: "state_conflict" }));
+    }
+
+    await this.deps.gateway.applyListeningHoldRelease(tx, {
+      orderId: ctx.orderId,
+      partnerId: ctx.partnerId,
+      numberId: ctx.numberId,
+      expectedVersion: ctx.version,
+      completedAtEpochMs: decision.completedAtMs,
+      fromNumberStatus: ctx.numberStatus,
+      toNumberStatus: decision.nextNumberStatus,
+      numberChanged: decision.numberChanged,
+      reason: input.trigger,
+      actorRef: input.actorRef,
+      operationKey: decision.operationKey,
+    });
+
+    return completeSuccess(ctx.orderId, decision.completedAtMs, decision.releaseDisposition);
   }
 
   /**
@@ -395,5 +533,31 @@ function errorResult(error: SafeError): TerminalResult {
 }
 
 function bodyFor(error: SafeError): TerminalResponseBody {
+  return { error: { code: error.code, message: error.message, retryable: error.retryable } };
+}
+
+function completeSuccess(
+  orderId: string,
+  completedAtEpochMs: number,
+  releaseDisposition: ReleaseDisposition | null,
+): { statusCode: number; response: CompleteResponseBody } {
+  const view: CompletedOrderView = {
+    partnerOrderId: orderId,
+    status: "success",
+    completedAt: new Date(completedAtEpochMs).toISOString(),
+    releaseDisposition,
+  };
+  return { statusCode: 200, response: { data: view } };
+}
+
+function completeEffectError(error: SafeError): { statusCode: number; response: CompleteResponseBody } {
+  return { statusCode: error.status, response: completeBodyFor(error) };
+}
+
+function completeError(error: SafeError): CompleteResult {
+  return { statusCode: error.status, body: completeBodyFor(error) };
+}
+
+function completeBodyFor(error: SafeError): CompleteResponseBody {
   return { error: { code: error.code, message: error.message, retryable: error.retryable } };
 }

@@ -101,6 +101,39 @@ export interface OrderTransitionContext {
   readonly numberEnabled: boolean;
   readonly deviceStatus: DeviceEffectiveStatus;
   readonly deviceLastSeenAtEpochMs: number | null;
+  /**
+   * When a successful order's number hold was released. Null on a `success`
+   * order means it is still listening for a repeat OTP and still holds its
+   * number (see `order-listening-window`).
+   */
+  readonly completedAtEpochMs: number | null;
+  /**
+   * The order the number currently points at, or null. The listening release
+   * only ever touches a number this very order still holds.
+   */
+  readonly numberCurrentOrderId: string | null;
+}
+
+/**
+ * Everything the gateway needs to release one listening order's number hold
+ * atomically. The order's status does not change — it already settled as
+ * `success` — so only `completedAt` is stamped, plus the number release when
+ * this order still holds it.
+ */
+export interface ApplyListeningHoldReleaseInput {
+  readonly orderId: string;
+  readonly partnerId: string;
+  readonly numberId: string;
+  readonly expectedVersion: number;
+  readonly completedAtEpochMs: number;
+  readonly fromNumberStatus: NumberStatus;
+  readonly toNumberStatus: NumberStatus;
+  readonly numberChanged: boolean;
+  /** Why the hold ended: buyer completion or the expiry sweep. */
+  readonly reason: string;
+  /** Raw actor reference; the adapter persists only its hash. */
+  readonly actorRef: string;
+  readonly operationKey: string;
 }
 
 /** Everything the gateway needs to apply one terminal transition atomically. */
@@ -155,6 +188,19 @@ export interface OrderTransitionGateway<Tx> {
   applyTerminalTransition(
     tx: Tx,
     input: ApplyTerminalTransitionInput,
+  ): Promise<void>;
+
+  /**
+   * Release a listening order's number hold: stamp `completedAt` on the order
+   * (compare-and-set on the version and on the hold still being unreleased) and,
+   * when this order still holds the number, release it (`busy → available|offline`)
+   * with its `NumberStateHistory` row. The order's status is untouched and no
+   * money moves. Throws {@link TerminalTransitionContentionError} when the CAS
+   * matches no row.
+   */
+  applyListeningHoldRelease(
+    tx: Tx,
+    input: ApplyListeningHoldReleaseInput,
   ): Promise<void>;
 }
 

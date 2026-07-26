@@ -1,6 +1,7 @@
 import { $Enums } from "@/generated/prisma";
 
 import type {
+  ApplyListeningHoldReleaseInput,
   ApplyTerminalTransitionInput,
   OrderDetail,
   OrderOperationsConfig,
@@ -165,10 +166,12 @@ export class PrismaOrderOperationsGateway
         otpKeyVersion: true,
         createdAt: true,
         expiresAt: true,
+        completedAt: true,
         number: {
           select: {
             status: true,
             enabled: true,
+            currentOrderId: true,
             device: {
               select: { effectiveStatus: true, lastSeenAt: true },
             },
@@ -191,6 +194,8 @@ export class PrismaOrderOperationsGateway
       numberEnabled: order.number.enabled,
       deviceStatus: DEVICE_STATUS_FROM_DB[order.number.device.effectiveStatus],
       deviceLastSeenAtEpochMs: epochMsOrNull(order.number.device.lastSeenAt),
+      completedAtEpochMs: epochMsOrNull(order.completedAt),
+      numberCurrentOrderId: order.number.currentOrderId,
     };
   }
 
@@ -260,6 +265,61 @@ export class PrismaOrderOperationsGateway
         actorType: $Enums.AuditActorType.SYSTEM,
         actorRefHash: hashActorRef(input.actorRef),
         reason: input.terminalReason,
+        operationKey: `${input.operationKey}:number`,
+      },
+    });
+  }
+
+  async applyListeningHoldRelease(
+    tx: PartnerTransactionClient,
+    input: ApplyListeningHoldReleaseInput,
+  ): Promise<void> {
+    const completedAt = new Date(input.completedAtEpochMs);
+
+    // 1. Stamp the completion, guarded by a compare-and-set on the version and on
+    //    the hold still being unreleased. The order's status is NOT touched: it
+    //    already settled as `success` and completion moves no money.
+    const updated = await tx.partnerOrder.updateMany({
+      where: {
+        id: input.orderId,
+        partnerId: input.partnerId,
+        version: input.expectedVersion,
+        status: $Enums.PartnerOrderStatus.SUCCESS,
+        completedAt: null,
+      },
+      data: { completedAt, version: { increment: 1 } },
+    });
+    if (updated.count !== 1) throw new TerminalTransitionContentionError();
+
+    // No order transition row: `order_transitions` records a status edge, and
+    // completion deliberately leaves the status alone. The number history below
+    // is the audit trail for the release itself.
+    if (!input.numberChanged) return;
+
+    // 2. Release the number and unbind it. Pinning `currentOrderId` to this order
+    //    means a number already handed to another order is never stolen back.
+    const released = await tx.partnerNumber.updateMany({
+      where: {
+        id: input.numberId,
+        partnerId: input.partnerId,
+        status: NUMBER_STATUS_TO_DB[input.fromNumberStatus],
+        currentOrderId: input.orderId,
+      },
+      data: {
+        status: NUMBER_STATUS_TO_DB[input.toNumberStatus],
+        currentOrderId: null,
+      },
+    });
+    if (released.count !== 1) throw new TerminalTransitionContentionError();
+
+    await tx.numberStateHistory.create({
+      data: {
+        numberId: input.numberId,
+        fromStatus: NUMBER_STATUS_TO_DB[input.fromNumberStatus],
+        toStatus: NUMBER_STATUS_TO_DB[input.toNumberStatus],
+        actorType: $Enums.AuditActorType.SYSTEM,
+        actorRefHash: hashActorRef(input.actorRef),
+        reason: input.reason,
         operationKey: `${input.operationKey}:number`,
       },
     });

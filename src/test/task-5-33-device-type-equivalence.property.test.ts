@@ -204,8 +204,10 @@ function coreDomainOutcome(type: DeviceType, shared: SharedInputs): unknown {
   });
 
   // The order/number lifecycle consumes only the SERVER-OBSERVED effective
-  // status + last-seen instant, never the device type. A terminal success from
-  // waiting_sms/busy exercises the release disposition path.
+  // status + last-seen instant, never the device type. The release disposition
+  // path is exercised directly through `decideNumberRelease` on that
+  // server-observed context; the terminal success from waiting_sms/busy exercises
+  // the order edge itself, which keeps the number held for the listening window.
   const releaseContext = {
     numberEnabled: shared.numberEnabled,
     deviceStatus: effective,
@@ -219,7 +221,7 @@ function coreDomainOutcome(type: DeviceType, shared: SharedInputs): unknown {
     orderStatus: "waiting_sms",
     numberStatus: "busy",
     otpReceived: false,
-    command: { type: "succeed", release: releaseContext },
+    command: { type: "succeed" },
   });
 
   return {

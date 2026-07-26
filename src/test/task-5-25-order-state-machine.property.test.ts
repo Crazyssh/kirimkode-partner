@@ -32,6 +32,11 @@ import {
 //   timed out; every transition is CAS on expected state; retry of the same
 //   transition returns the already-reached state; a different terminal yields
 //   TERMINAL_STATE_CONFLICT with no second money effect (Components §9).
+// - Number release is decoupled from the terminal status: cancel/timeout/fail
+//   release the number, but `success` keeps it held for the listening window so a
+//   repeat OTP can still match the same order. That hold is released exactly once
+//   elsewhere (`decideListeningHoldRelease`), so this model predicts an unchanged
+//   number for the waiting_sms→success edge.
 // - Requirement 12.1 enumerates the supported statuses; 12.3 makes the success
 //   transition idempotent; 12.6 forbids conflicting terminal transitions.
 // - Testing Strategy: the order state machine is a 500-run target on nightly CI.
@@ -76,12 +81,9 @@ function validRelease(observedAtMs: number): ServerObservedReleaseContext {
 const commandArbitrary: fc.Arbitrary<OrderTransitionCommand> = fc.oneof(
   fc.constant<OrderTransitionCommand>({ type: "reserve" }),
   fc.constant<OrderTransitionCommand>({ type: "activate" }),
-  fc
-    .constant(CREATED_AT + TIMEOUT_MS)
-    .map<OrderTransitionCommand>((observedAtMs) => ({
-      type: "succeed",
-      release: validRelease(observedAtMs),
-    })),
+  // Succeed carries no release context: it settles the order but keeps the
+  // number held for the listening window (see `appliedNextNumber`).
+  fc.constant<OrderTransitionCommand>({ type: "succeed" }),
   fc
     .record({
       reason: fc.constantFrom("BUYER_REQUEST", "MAIN_COMPENSATION"),
@@ -167,7 +169,10 @@ function requiredNumberSource(
 ): NumberStatus | null {
   if (target === "reserved") return "available";
   if (target === "waiting_sms") return "reserved";
-  // Terminal targets from an active order require the paired number state.
+  // Terminal targets from an active order require the paired number state. This
+  // still holds for `success`, which no longer releases: the only legal source is
+  // waiting_sms→success and the order must genuinely still hold the number as
+  // `busy` to settle on it.
   if (orderStatus === "reserved") return "reserved";
   if (orderStatus === "waiting_sms") return "busy";
   return null; // created→failed
@@ -242,8 +247,12 @@ function appliedNextNumber(
 ): NumberStatus {
   if (target === "reserved") return "reserved";
   if (target === "waiting_sms") return "busy";
+  // Success settles the order but does NOT release: the order keeps holding its
+  // number for the listening window so a repeat OTP can still match it. The hold
+  // is released exactly once later, outside this machine.
+  if (target === "success") return currentNumber;
   if (orderStatus === "created") return currentNumber; // created→failed: number untouched
-  // Terminal from an active order releases via the release context.
+  // The remaining terminals (cancel/timeout/fail) release via the release context.
   const release = "release" in command ? command.release : null;
   return release === null ? currentNumber : decideNumberRelease(release);
 }

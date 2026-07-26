@@ -69,11 +69,48 @@ const EARNING_STATUS_TO_BUCKET: Readonly<
   REVERSED: "partner_reversed",
 };
 
-/** Active (number-holding) order statuses used to pair orders and numbers. */
+/**
+ * Active (number-holding) order statuses used to pair orders and numbers.
+ *
+ * `success` is deliberately absent: after the listening window was introduced, a
+ * settled order holds its number for as long as it may still receive a repeat
+ * OTP, which is a predicate over three columns rather than a status — see
+ * {@link listeningOrderWhere}.
+ */
 const ACTIVE_ORDER_STATUSES: readonly $Enums.PartnerOrderStatus[] = [
   $Enums.PartnerOrderStatus.RESERVED,
   $Enums.PartnerOrderStatus.WAITING_SMS,
 ];
+
+/**
+ * A `success` order that has not released its number hold, and therefore still
+ * holds it (the hold is decoupled from the terminal status; see
+ * {@link import("@domain/order-listening-window").isListeningOrder}).
+ *
+ * The reconciler must count such an order as an active holder, otherwise a held
+ * `busy` number whose only holder is a settled-but-unreleased order looks like it
+ * has zero active orders and mints a false `number_missing_active_order` finding.
+ * The converse still fires: once `completedAt` is stamped the order holds nothing,
+ * so a number left `busy` behind it is a genuine leak the detector must report.
+ *
+ * Deliberately NOT filtered on `expiresAt`. Holding is a fact about the write
+ * that releases it, and that release compare-and-sets on exactly this predicate
+ * (`success` + `completedAt IS NULL`) — nothing else. Adding the deadline would
+ * make the reconciler disagree with the database for the interval between a
+ * window closing and the ~1-minute sweep actually closing it, minting durable
+ * issues that block financial operations for state that is perfectly consistent.
+ * The cost is that a permanently broken sweep leaves a held number unreported
+ * here; that is job liveness, which belongs to a job-health signal rather than to
+ * a state-consistency detector.
+ */
+function listeningOrderWhere(): Prisma.PartnerOrderWhereInput {
+  return {
+    status: $Enums.PartnerOrderStatus.SUCCESS,
+    // Stamped exactly once, by buyer completion or the expiry sweep — the two
+    // paths that actually release the hold.
+    completedAt: null,
+  };
+}
 
 /**
  * Prisma-backed read + record gateway for the `reconcile` job (task 16.4).
@@ -181,8 +218,16 @@ export class PrismaReconciliationGateway implements ReconciliationGateway {
             where: { partnerId },
             select: { id: true, status: true },
           }),
+          // Every order that currently holds a number: the two active statuses,
+          // plus a settled order still inside its listening window.
           tx.partnerOrder.findMany({
-            where: { partnerId, status: { in: [...ACTIVE_ORDER_STATUSES] } },
+            where: {
+              partnerId,
+              OR: [
+                { status: { in: [...ACTIVE_ORDER_STATUSES] } },
+                listeningOrderWhere(),
+              ],
+            },
             select: { id: true, numberId: true, status: true },
           }),
           tx.partnerDevice.findMany({
@@ -203,8 +248,11 @@ export class PrismaReconciliationGateway implements ReconciliationGateway {
       { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
     );
 
-    // Group active orders by the number they hold, for both the number-centric
-    // checks and the order/number pairing check.
+    // Group the number-holding orders by the number they hold, for both the
+    // number-centric checks and the order/number pairing check. A listening
+    // order participates in both: it must be counted as its number's one active
+    // holder, and the pairing check independently requires its number to be
+    // `busy` — a listening order on a released number is a real inconsistency.
     const activeByNumber = new Map<string, string[]>();
     for (const order of activeOrderRows) {
       const list = activeByNumber.get(order.numberId) ?? [];

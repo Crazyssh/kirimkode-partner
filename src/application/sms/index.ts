@@ -22,9 +22,11 @@ export {
   toSafeSmsLogDescriptor,
 } from "./sms-encryption";
 export type {
+  ApplySmsRepeatOtpInput,
   ApplySmsSuccessInput,
   Clock,
   IdGenerator,
+  OrderRepeatOtpContext,
   OrderSuccessContext,
   SmsAuditMatchStatus,
   SmsMatchingConfig,
@@ -35,6 +37,7 @@ export type {
   SmsSuccessEarning,
 } from "./matching-ports";
 export { SmsSuccessContentionError } from "./matching-ports";
+export type { SmsMatchMode } from "@domain/sms-matching-otp";
 export {
   SmsDependencyUnavailableError,
   SmsIngestionService,

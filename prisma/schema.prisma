@@ -439,6 +439,10 @@ model PartnerOrder {
   reservedAt       DateTime?          @db.Timestamptz(6)
   waitingAt        DateTime?          @db.Timestamptz(6)
   succeededAt      DateTime?          @db.Timestamptz(6)
+  /// When the number hold was released after success — by the buyer completing
+  /// the order or by the expiry sweep. NULL on a successful order means it is
+  /// still listening for a repeat OTP and still holds its number.
+  completedAt      DateTime?          @db.Timestamptz(6)
   terminalAt       DateTime?          @db.Timestamptz(6)
   version          Int                @default(1)
   partner          Partner            @relation(fields: [partnerId], references: [id], onDelete: Restrict, onUpdate: Cascade)

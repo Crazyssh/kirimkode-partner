@@ -21,9 +21,19 @@ beforeAll(async () => {
 
 // **Validates: Requirements 8.2, 16.5, 19.4, 22.3, 22.4, 23.1**
 describe("Task 3.4 Partner baseline migration and seed", () => {
-  it("keeps exactly one additive canonical Partner migration", async () => {
+  it("keeps the canonical Partner baseline first and every later migration additive", async () => {
+    // The baseline is no longer the only migration: an applied schema evolves
+    // through NEW additive migrations, never by editing the baseline in place —
+    // an in-place edit keeps its recorded name, so Prisma never re-applies it and
+    // already-migrated databases silently drift from the file on disk.
     const entries = await readdir(path.join(root, "prisma/migrations"), { withFileTypes: true });
-    expect(entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)).toEqual([migrationName]);
+    const names = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    expect(names[0]).toBe(migrationName);
+    // Every migration, not just the baseline, must be free of destructive SQL.
+    for (const name of names) {
+      const sql = await readFile(path.join(root, "prisma/migrations", name, "migration.sql"), "utf8");
+      expect(scanMigrationSql(sql, `${name}/migration.sql`)).toEqual([]);
+    }
     expect(scanMigrationSql(migration, `${migrationName}/migration.sql`)).toEqual([]);
     expect(migration).not.toMatch(/\b(?:CREATE|ALTER|GRANT|REVOKE|CONNECT)\b[^;]*\bDATABASE\s+"?kirimkode"?(?:\s|;)/i);
   });

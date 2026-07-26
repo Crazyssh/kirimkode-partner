@@ -19,6 +19,7 @@ import { IdempotencyEngine, type IdempotencyStore } from "@application/internal-
 import {
   ReservationService,
   OrderStatusService,
+  OrderTransitionService,
   type ReserveCommandInput,
   type ReserveResult,
 } from "@application/orders";
@@ -80,18 +81,27 @@ import {
  *   3. Submit a WhatsApp OTP SMS through the ingestion pipeline
  *      ({@link SmsIngestionService}): order → success, encrypted OTP stored,
  *      exactly one PENDING Earning at Rp1.000, a zero-sum `order-success`
- *      ledger event, number released (17.2, 23.3).
+ *      ledger event — and the number stays BUSY, still bound to the order,
+ *      because the settled order keeps *listening* for a repeat code (17.2, 23.3).
  *   4. Read the OTP back through the status/decrypt path
  *      ({@link OrderStatusService}) and prove raw SMS is never surfaced.
- *   5. Advance the clock 24h and run the earning-release command
+ *   5. Submit a SECOND WhatsApp SMS on the same number while the window is open:
+ *      it matches the SAME order in `repeat` mode and only refreshes the OTP —
+ *      no status change, no second Earning, no second ledger event (11.7, 13.7).
+ *   6. Close the listening window through the buyer-completion command
+ *      ({@link OrderTransitionService.complete}): `completedAt` is stamped, the
+ *      number returns to AVAILABLE and unbound, the order stays `success`, and
+ *      the Earning is untouched. A repeated completion is idempotent (12.4, 12.6).
+ *   7. Advance the clock 24h and run the earning-release command
  *      ({@link EarningLifecycleService}): Earning → available.
- *   6. Request a payout of Rp1.000 (create destination + request payout): the
+ *   8. Request a payout of Rp1.000 (create destination + request payout): the
  *      Earning locks, the ledger moves available → locked.
- *   7. Admin approves → processing → paid with a unique payment reference:
+ *   9. Admin approves → processing → paid with a unique payment reference:
  *      Earning → paid, ledger locked → paid.
- *   8. Run the reconciler ({@link ReconcileJob}) and assert ZERO issues — the
- *      whole flow is internally consistent — and that the ledger nets to zero
- *      with the money resting in `partner_paid` (Rp1.000) (23.3, 20.6).
+ *  10. Run the reconciler ({@link ReconcileJob}) and assert ZERO issues — the
+ *      whole flow is internally consistent, the hold having been released in
+ *      step 6 — and that the ledger nets to zero with the money resting in
+ *      `partner_paid` (Rp1.000) (23.3, 20.6).
  *
  * A single {@link MutableClock} anchored at wall-clock time drives every
  * service, so the DB-default `receivedAtServer` on the inbound SMS falls inside
@@ -114,9 +124,31 @@ const PAYOUT_IDR = 1_000;
 const PLATFORM_MARGIN_IDR = 400;
 const HOLD_PERIOD_MS = 24 * 60 * 60 * 1000;
 
-const OTP = "123456";
-const SMS_BODY = `Your WhatsApp code is ${OTP}`;
+// A verbatim real-world WhatsApp Business verification SMS: the code arrives
+// in the dashed wire format (`718-891`) and the parser normalizes it to the
+// six-digit OTP, so this E2E run proves the real format end-to-end.
+const OTP = "718891";
+const SMS_BODY = [
+  "Akun WhatsApp Business Anda sedang didaftarkan di perangkat baru",
+  "",
+  "Jangan bagikan kode dengan siapa pun",
+  "Kode WhatsApp Business Anda: 718-891",
+  "rJbA/XP1K+V",
+].join("\n");
 const SMS_SENDER = "WhatsAppBusiness";
+
+// The resend WhatsApp routinely issues when the buyer taps "kirim ulang": the
+// same message shape carrying a DIFFERENT code. It is the whole point of the
+// listening window — the second code must reach the same order rather than a
+// number that was already put back on sale.
+const REPEAT_OTP = "204653";
+const REPEAT_SMS_BODY = [
+  "Akun WhatsApp Business Anda sedang didaftarkan di perangkat baru",
+  "",
+  "Jangan bagikan kode dengan siapa pun",
+  "Kode WhatsApp Business Anda: 204-653",
+  "hQ2c/Nm8R+T",
+].join("\n");
 
 /** A deterministic test AES key/version for the SMS/OTP + destination envelope. */
 const CIPHER_KEY_VERSION = 5;
@@ -229,10 +261,20 @@ function createServices(client: PartnerDatabaseClient, clock: MutableClock) {
     idGenerator: new CryptoIdGenerator(),
   });
 
-  // Status / OTP decrypt read path (the cipher IS the real OtpDecryptor).
+  // Status / OTP decrypt read path (the cipher IS the real OtpDecryptor) and the
+  // task 9.4 transition service, which owns buyer completion — the command that
+  // closes a listening window and releases the number hold. Both sit on one
+  // gateway instance, and completion shares the reserve path's idempotency
+  // engine + clock so a replayed completion is replayed, not re-applied.
+  const operations = new PrismaOrderOperationsGateway(client);
   const status = new OrderStatusService({
-    gateway: new PrismaOrderOperationsGateway(client),
+    gateway: operations,
     otpDecryptor: cipher,
+  });
+  const transition = new OrderTransitionService<PartnerTransactionClient>({
+    idempotency,
+    gateway: operations,
+    clock,
   });
 
   // Ledger + payout stack.
@@ -275,6 +317,7 @@ function createServices(client: PartnerDatabaseClient, clock: MutableClock) {
     reservation,
     sms,
     status,
+    transition,
     earningLifecycle,
     destinations,
     requests,
@@ -307,8 +350,11 @@ async function runToCompletion(runner: CronBatchRunner, job: BatchJob): Promise<
 // member (payout requester), and a payout-review admin.
 // ---------------------------------------------------------------------------
 function uniqueCanonicalNumber(): string {
-  let digits = "";
-  for (let i = 0; i < 9; i += 1) digits += String(randomInt(0, 10));
+  // Canonical rule: `+628` then a NON-ZERO digit, then 8 more. Drawing the
+  // first digit from 0-9 produced `+6280…` roughly one run in ten, which the
+  // domain rightly rejects — a self-inflicted flake, not a product bug.
+  let digits = String(randomInt(1, 10));
+  for (let i = 0; i < 8; i += 1) digits += String(randomInt(0, 10));
   return `+628${digits}`;
 }
 
@@ -460,7 +506,7 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     await database?.dispose();
   }, 30_000);
 
-  it("drives inventory -> reserve -> SMS -> OTP -> hold -> payout -> paid -> zero-issue reconciliation", async () => {
+  it("drives inventory -> reserve -> SMS -> OTP -> repeat OTP -> complete -> hold -> payout -> paid -> zero-issue reconciliation", async () => {
     // Anchor the clock at wall-clock time so the reserve order window contains
     // the DB-default `receivedAtServer` of the inbound SMS, while still allowing
     // the 24h hold to be advanced deterministically.
@@ -577,12 +623,17 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     expect(successLedger.entries).toHaveLength(2);
     expect(successLedger.entries.reduce((t, e) => t + e.amountIdrSigned, 0)).toBe(0);
 
-    // The number is released back to available and unbound (device online).
-    const releasedNumber = await client.partnerNumber.findUniqueOrThrow({
+    // The number hold is NOT released by success. The money settled exactly once
+    // (the single Earning + zero-sum event above), but the order goes on
+    // *listening*: `completedAt` is unset and the number stays BUSY and bound to
+    // the order, so a resent code still reaches this buyer and the number cannot
+    // be resold underneath an SMS that is still in flight.
+    expect(successOrder.completedAt).toBeNull();
+    const heldNumber = await client.partnerNumber.findUniqueOrThrow({
       where: { id: supply.numberId },
     });
-    expect(releasedNumber.status).toBe("AVAILABLE");
-    expect(releasedNumber.currentOrderId).toBeNull();
+    expect(heldNumber.status).toBe("BUSY");
+    expect(heldNumber.currentOrderId).toBe(orderId);
 
     // -------------------------------------------------------------------
     // 4. Read the OTP back through the status/decrypt path (Req 11.6/17.5).
@@ -596,7 +647,109 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     expect(JSON.stringify(statusResult.body.data)).not.toContain("WhatsApp");
 
     // -------------------------------------------------------------------
-    // 5. Advance the clock 24h and release the earning hold (Req 13.4).
+    // 5. A repeat OTP inside the open window refreshes the code only (Req 11.7,
+    //    13.7). This is what the listening window buys: WhatsApp resends, and
+    //    the second code must land on the SAME order — with no money moving,
+    //    since an Earning is created exactly once per order.
+    // -------------------------------------------------------------------
+    const repeatIngestion = await services.sms.ingest({
+      principal: { partnerId: supply.partnerId, deviceId: supply.deviceId },
+      numberId: supply.numberId,
+      // A genuinely distinct message: same device, new messageId + idempotency
+      // key, so neither unique constraint short-circuits it as a `duplicate`.
+      messageId: randomUUID(),
+      idempotencyKey: randomUUID(),
+      sender: SMS_SENDER,
+      body: REPEAT_SMS_BODY,
+      receivedAtDeviceEpochMs: clock.nowEpochMs() - 500,
+    });
+    expect(repeatIngestion.status).toBe("matched");
+    if (repeatIngestion.status !== "matched") throw new Error("repeat SMS did not match");
+    expect(repeatIngestion.orderId).toBe(orderId);
+    expect(repeatIngestion.mode).toBe("repeat");
+
+    // The buyer now reads the NEWER code through the same status path.
+    const refreshedStatus = await services.status.getStatus({ orderId });
+    if (!("data" in refreshedStatus.body)) throw new Error("status did not return data");
+    expect(refreshedStatus.body.data.otp).toBe(REPEAT_OTP);
+    expect(refreshedStatus.body.data.status).toBe("success");
+
+    // Status unchanged, hold still open, and the money side is untouched:
+    // still exactly ONE Earning at the same amount and still exactly ONE
+    // `order-success` ledger transaction.
+    const orderAfterRepeat = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+    expect(orderAfterRepeat.status).toBe("SUCCESS");
+    expect(orderAfterRepeat.completedAt).toBeNull();
+    expect(orderAfterRepeat.otpFingerprint).toBe(cipher.fingerprint(REPEAT_OTP));
+    const earningsAfterRepeat = await client.partnerEarning.findMany({ where: { orderId } });
+    expect(earningsAfterRepeat).toHaveLength(1);
+    expect(earningsAfterRepeat[0].id).toBe(earningId);
+    expect(earningsAfterRepeat[0].amountIdr).toBe(PAYOUT_IDR);
+    expect(earningsAfterRepeat[0].status).toBe("PENDING");
+    expect(
+      await client.ledgerTransaction.count({ where: { eventKey: orderSuccessEventKey(orderId) } }),
+    ).toBe(1);
+
+    // -------------------------------------------------------------------
+    // 6. Buyer completion closes the listening window (Req 12.4, 12.6): the
+    //    hold — not the status — ends. `completedAt` is stamped and the number
+    //    goes back on sale; no money moves, because it already settled.
+    // -------------------------------------------------------------------
+    const completed = await services.transition.complete({
+      orderId,
+      principalId: "main-platform-client",
+      idempotencyKey: `complete-${randomUUID()}`,
+      method: "POST",
+      path: `/api/internal/v1/orders/${orderId}/complete`,
+      trigger: "buyer_complete",
+      actorRef: "main-actor",
+    });
+    expect(completed.statusCode).toBe(200);
+    if (!("data" in completed.body)) throw new Error("completion did not succeed");
+    expect(completed.body.data.status).toBe("success");
+    // The device is still beating (the clock has not moved yet), so the released
+    // number returns to `available` rather than `offline`.
+    expect(completed.body.data.releaseDisposition).toBe("available");
+
+    const completedOrder = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+    expect(completedOrder.status).toBe("SUCCESS");
+    expect(completedOrder.completedAt).not.toBeNull();
+    const completedAtMs = completedOrder.completedAt?.getTime() ?? 0;
+    const releasedNumber = await client.partnerNumber.findUniqueOrThrow({
+      where: { id: supply.numberId },
+    });
+    expect(releasedNumber.status).toBe("AVAILABLE");
+    expect(releasedNumber.currentOrderId).toBeNull();
+    // Completion is not a money event: the Earning is exactly as success left it.
+    const earningAfterComplete = await client.partnerEarning.findMany({ where: { orderId } });
+    expect(earningAfterComplete).toHaveLength(1);
+    expect(earningAfterComplete[0].id).toBe(earningId);
+    expect(earningAfterComplete[0].amountIdr).toBe(PAYOUT_IDR);
+    expect(earningAfterComplete[0].status).toBe("PENDING");
+
+    // A second completion under a FRESH idempotency key bypasses the engine's
+    // replay and re-enters the effect, where the already-stamped `completedAt`
+    // makes the release decision a no-op: success reported, nothing changed. That
+    // is what keeps the buyer and the expiry sweep from releasing a hold twice.
+    const recompleted = await services.transition.complete({
+      orderId,
+      principalId: "main-platform-client",
+      idempotencyKey: `complete-${randomUUID()}`,
+      method: "POST",
+      path: `/api/internal/v1/orders/${orderId}/complete`,
+      trigger: "buyer_complete",
+      actorRef: "main-actor",
+    });
+    expect(recompleted.statusCode).toBe(200);
+    if (!("data" in recompleted.body)) throw new Error("second completion did not succeed");
+    expect(recompleted.body.data.completedAt).toBe(new Date(completedAtMs).toISOString());
+    const afterRecomplete = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+    expect(afterRecomplete.completedAt?.getTime()).toBe(completedAtMs);
+    expect(afterRecomplete.status).toBe("SUCCESS");
+    expect(await client.partnerEarning.count({ where: { orderId } })).toBe(1);
+
+    // -------------------------------------------------------------------
+    // 7. Advance the clock 24h and release the earning hold (Req 13.4).
     // -------------------------------------------------------------------
     clock.advance(HOLD_PERIOD_MS + 5 * 60_000);
     const released = await services.earningLifecycle.releaseHold({
@@ -615,7 +768,7 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     expect(balances.partner_available).toBe(PAYOUT_IDR);
 
     // -------------------------------------------------------------------
-    // 6. Request a payout of Rp1.000 -> Earning locked, ledger available->locked
+    // 8. Request a payout of Rp1.000 -> Earning locked, ledger available->locked
     //    (Req 14.1, 14.2, 23.3).
     // -------------------------------------------------------------------
     const destination = await services.destinations.createDestination({
@@ -648,7 +801,7 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     expect(balances.partner_payout_locked).toBe(PAYOUT_IDR);
 
     // -------------------------------------------------------------------
-    // 7. Admin approves -> processing -> paid with a unique reference (Req 14.4).
+    // 9. Admin approves -> processing -> paid with a unique reference (Req 14.4).
     // -------------------------------------------------------------------
     expect((await services.reviews.approve({ admin, payoutId, requestId: randomUUID() })).ok).toBe(true);
     expect(
@@ -675,8 +828,10 @@ describe.runIf(hasPostgres)("Private beta full-flow E2E integration (task 17.6)"
     expect(paidEvents).toBe(1);
 
     // -------------------------------------------------------------------
-    // 8. Reconcile -> ZERO issues, and the ledger nets to zero with the money
-    //    resting in partner_paid (Req 23.3, 20.6).
+    // 10. Reconcile -> ZERO issues, and the ledger nets to zero with the money
+    //     resting in partner_paid (Req 23.3, 20.6). The reconciler sees a
+    //     consistent projection because step 6 released the hold: the number is
+    //     available with no active order, and the completed order claims none.
     // -------------------------------------------------------------------
     // The simulator keeps beating; refresh the heartbeat so the still-ONLINE
     // device is not (correctly) flagged stale after the 24h fast-forward.

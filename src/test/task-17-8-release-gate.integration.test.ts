@@ -67,17 +67,21 @@ async function deployFromEmpty(connectionString: string): Promise<void> {
 }
 
 function uniqueCanonicalNumber(): string {
-  let digits = "";
-  for (let i = 0; i < 9; i += 1) digits += String(randomInt(0, 10));
+  // Canonical rule: `+628` then a NON-ZERO digit, then 8 more. Drawing the
+  // first digit from 0-9 produced `+6280…` roughly one run in ten, which the
+  // domain rightly rejects — a self-inflicted flake, not a product bug.
+  let digits = String(randomInt(1, 10));
+  for (let i = 0; i < 8; i += 1) digits += String(randomInt(0, 10));
   return `+628${digits}`;
 }
 
 /**
  * A fully consistent, terminal single-order supply for one partner: an approved
  * partner, an (offline) simulator device, an active `wa/ID/any` offer, an
- * `available` number, one SUCCESS order with its immutable snapshot, and one
- * PENDING earning at the snapshot payout. The order-success ledger event is
- * appended separately through the real ledger repository.
+ * `available` number, one CLOSED SUCCESS order (its listening window released,
+ * hence the free number) with its immutable snapshot, and one PENDING earning at
+ * the snapshot payout. The order-success ledger event is appended separately
+ * through the real ledger repository.
  */
 async function seedConsistentPartner(client: PartnerDatabaseClient): Promise<{
   readonly partnerId: string;
@@ -155,6 +159,15 @@ async function seedConsistentPartner(client: PartnerDatabaseClient): Promise<{
       waitingAt: now,
       succeededAt: now,
       terminalAt: now,
+      // A CLOSED success is the consistent terminal shape, and `completedAt` is
+      // what closes it. Since the listening window decoupled the number hold from
+      // the terminal status, a `success` order with `completedAt` unset still
+      // *holds* its number — so pairing one with an `available`, unbound number
+      // would seed the contradiction the reconciler is built to catch (an order
+      // claiming a number that claims no order) and the gate would rightly report
+      // it. Stamping completion at `succeededAt` says the hold was released, which
+      // is exactly why the number below is legitimately free.
+      completedAt: now,
     },
   });
   await client.orderSnapshot.create({

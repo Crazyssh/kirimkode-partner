@@ -5,10 +5,12 @@ import {
   SmsIngestionService,
   SmsOwnershipMismatchError,
   SmsSuccessContentionError,
+  type ApplySmsRepeatOtpInput,
   type ApplySmsSuccessInput,
   type EncryptedField,
   type EncryptedSmsRecord,
   type IngestSmsInput,
+  type OrderRepeatOtpContext,
   type OrderSuccessContext,
   type PartnerSmsGateway,
   type PartnerSmsInsertResult,
@@ -37,6 +39,8 @@ const DEVICE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const NUMBER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const ORDER_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 const SMS_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+/** A second order id, used to build an inconsistent two-holder projection. */
+const OTHER_ORDER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const NOW = 1_700_000_000_000;
 const KEY_VERSION = 7;
 
@@ -117,10 +121,14 @@ interface MatchingState {
   candidates: readonly SmsOrderCandidateRow[];
   successContext: OrderSuccessContext | null;
   applyThrows: boolean;
+  /** Repeat-OTP path: the still-listening order a repeat SMS refreshes. */
+  repeatContext: OrderRepeatOtpContext | null;
+  repeatThrows: boolean;
 }
 
 class FakeMatchingGateway implements SmsMatchingGateway<Tx> {
   readonly applied: ApplySmsSuccessInput[] = [];
+  readonly repeated: ApplySmsRepeatOtpInput[] = [];
   readonly audited: Array<{ smsId: string; matchStatus: SmsAuditMatchStatus }> = [];
   constructor(private readonly state: MatchingState) {}
 
@@ -139,6 +147,13 @@ class FakeMatchingGateway implements SmsMatchingGateway<Tx> {
   async applySuccess(_tx: Tx, input: ApplySmsSuccessInput): Promise<void> {
     if (this.state.applyThrows) throw new SmsSuccessContentionError();
     this.applied.push(input);
+  }
+  async loadRepeatOtpContext(): Promise<OrderRepeatOtpContext | null> {
+    return this.state.repeatContext;
+  }
+  async applyRepeatOtp(_tx: Tx, input: ApplySmsRepeatOtpInput): Promise<void> {
+    if (this.state.repeatThrows) throw new SmsSuccessContentionError();
+    this.repeated.push(input);
   }
   async markSmsAudited(
     _tx: Tx,
@@ -161,6 +176,29 @@ function waitingCandidate(overrides: Partial<SmsOrderCandidateRow> = {}): SmsOrd
     status: "waiting_sms",
     windowStartsAtMs: NOW - 60_000,
     windowEndsAtMs: NOW + 60_000,
+    completedAtMs: null,
+    ...overrides,
+  });
+}
+
+/**
+ * A candidate that already succeeded and is still listening: same number, hold
+ * not yet released, window still open. A repeat SMS must refresh its OTP without
+ * ever creating a second Earning.
+ */
+function listeningCandidate(overrides: Partial<SmsOrderCandidateRow> = {}): SmsOrderCandidateRow {
+  return waitingCandidate({ status: "success", completedAtMs: null, ...overrides });
+}
+
+function repeatContext(overrides: Partial<OrderRepeatOtpContext> = {}): OrderRepeatOtpContext {
+  return Object.freeze({
+    orderId: ORDER_ID,
+    partnerId: PARTNER_ID,
+    numberId: NUMBER_ID,
+    version: 7,
+    orderStatus: "success" as const,
+    completedAtEpochMs: null,
+    expiresAtEpochMs: NOW + 60_000,
     ...overrides,
   });
 }
@@ -193,6 +231,8 @@ function baseState(overrides: Partial<MatchingState> = {}): MatchingState {
     candidates: [waitingCandidate()],
     successContext: successContext(),
     applyThrows: false,
+    repeatContext: repeatContext(),
+    repeatThrows: false,
     ...overrides,
   };
 }
@@ -246,14 +286,19 @@ describe("SmsIngestionService", () => {
     expect(result.sms.matchStatus).toBe("matched");
     expect(result.sms.matchedOrderId).toBe(ORDER_ID);
 
+    expect(result.mode).toBe("first");
+
     // Exactly one success write, carrying an OTP *ciphertext* (never the raw
-    // "123456"), the busy->available release, and the extracted key version.
+    // "123456") and the extracted key version. The number is deliberately NOT
+    // released: the order keeps holding it for its listening window so a repeat
+    // OTP can still arrive, and so the number cannot be resold while a resent
+    // SMS for this buyer is still in flight.
     expect(matchingGateway.applied).toHaveLength(1);
     const applied = matchingGateway.applied[0];
     expect(applied.otpKeyVersion).toBe(KEY_VERSION);
     expect(new TextDecoder().decode(applied.otpCiphertext)).toBe("enc:123456");
-    expect(applied.toNumberStatus).toBe("available");
-    expect(applied.numberChanged).toBe(true);
+    expect(applied.toNumberStatus).toBe("busy");
+    expect(applied.numberChanged).toBe(false);
     expect(matchingGateway.audited).toHaveLength(0);
 
     // Exactly one pending Earning at the snapshot payout, held 24h from now
@@ -281,6 +326,82 @@ describe("SmsIngestionService", () => {
     expect(new TextDecoder().decode(record.bodyCiphertext)).toBe(
       "enc:Your WhatsApp code is 123456",
     );
+  });
+
+  it("refreshes the OTP of a still-listening order without touching money", async () => {
+    // The order already succeeded and has not released its hold: a second code
+    // (services routinely resend one) updates the OTP in place.
+    state.candidates = [listeningCandidate()];
+    const { service, matchingGateway } = makeService(state);
+
+    const result = await service.ingest(input());
+
+    expect(result.status).toBe("matched");
+    if (result.status !== "matched") throw new Error("unreachable");
+    expect(result.mode).toBe("repeat");
+    expect(result.orderId).toBe(ORDER_ID);
+    expect(result.sms.matchedOrderId).toBe(ORDER_ID);
+
+    // Only the repeat write ran: no success transition, so no second Earning and
+    // no ledger event — money is created exactly once per order.
+    expect(matchingGateway.applied).toHaveLength(0);
+    expect(matchingGateway.repeated).toHaveLength(1);
+    const repeated = matchingGateway.repeated[0];
+    expect(repeated.orderId).toBe(ORDER_ID);
+    expect(repeated.expectedOrderVersion).toBe(7);
+    expect(repeated.otpKeyVersion).toBe(KEY_VERSION);
+    expect(new TextDecoder().decode(repeated.otpCiphertext)).toBe("enc:123456");
+    expect(matchingGateway.audited).toHaveLength(0);
+  });
+
+  it("audits a repeat whose hold was released or window closed since the candidate load", async () => {
+    // The candidate snapshot is stale by the time the transaction reads the row:
+    // a released hold or a closed window means the order no longer owns the
+    // number, so the SMS is stored for audit rather than delivered.
+    for (const stale of [
+      repeatContext({ completedAtEpochMs: NOW - 1_000 }),
+      repeatContext({ expiresAtEpochMs: NOW - 1_000 }),
+      repeatContext({ orderStatus: "cancelled" }),
+      null,
+    ]) {
+      state.candidates = [listeningCandidate()];
+      state.repeatContext = stale;
+      const { service, matchingGateway } = makeService(state);
+
+      const result = await service.ingest(input());
+
+      expect(result.status).toBe("unmatched");
+      if (result.status !== "unmatched") throw new Error("unreachable");
+      expect(result.reason).toBe("no_active_order");
+      expect(matchingGateway.repeated).toHaveLength(0);
+      expect(matchingGateway.applied).toHaveLength(0);
+      expect(matchingGateway.audited).toEqual([
+        { smsId: SMS_ID, matchStatus: "unmatched" },
+      ]);
+    }
+  });
+
+  it("surfaces a repeat contention as a retryable error with nothing delivered", async () => {
+    // A concurrent completion or expiry sweep won the compare-and-set: the whole
+    // transaction rolls back so the agent may safely retry.
+    state.candidates = [listeningCandidate()];
+    state.repeatThrows = true;
+    const { service } = makeService(state);
+
+    await expect(service.ingest(input())).rejects.toBeInstanceOf(SmsSuccessContentionError);
+  });
+
+  it("fails closed when a waiting order and a listening order both claim the number", async () => {
+    // A number is held by exactly one order, so this can only mean the
+    // projection is inconsistent — deliver the OTP to nobody.
+    state.candidates = [waitingCandidate(), listeningCandidate({ id: OTHER_ORDER_ID })];
+    const { service, matchingGateway } = makeService(state);
+
+    const result = await service.ingest(input());
+
+    expect(result.status).toBe("ambiguous");
+    expect(matchingGateway.applied).toHaveLength(0);
+    expect(matchingGateway.repeated).toHaveLength(0);
   });
 
   it("rejects an SMS whose device/number are not owned by the tenant", async () => {

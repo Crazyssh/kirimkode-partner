@@ -89,6 +89,7 @@ export { PrismaJobLeaseRepository } from "./job-lease-repository";
 export { PrismaOfflineSweepGateway } from "./offline-sweep-gateway";
 export { PrismaReservationRecoveryGateway } from "./reservation-recovery-gateway";
 export { PrismaOrderTimeoutGateway } from "./order-timeout-gateway";
+export { PrismaOrderCompletionSweepGateway } from "./order-completion-sweep-gateway";
 export { PrismaEarningReleaseGateway } from "./earning-release-gateway";
 export { PrismaRetentionGateway } from "./retention-gateway";
 export { PrismaReconciliationGateway } from "./reconciliation-gateway";

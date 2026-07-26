@@ -48,8 +48,10 @@ import {
   matchSmsToActiveOrder,
   parseServiceOtp,
   type OtpParseResult,
+  type SmsMatchMode,
 } from "@domain/sms-matching-otp";
 import { decideOrderNumberTransition } from "@domain/order-state-machine";
+import { isListeningOrder } from "@domain/order-listening-window";
 import { decideEarningOnSuccess } from "@domain/task-5-6";
 
 import type {
@@ -95,7 +97,17 @@ export type SmsUnmatchedReason =
  */
 export type SmsIngestionResult =
   | Readonly<{ status: "duplicate"; matchedBy: "message_id" | "idempotency_key" }>
-  | Readonly<{ status: "matched"; sms: SafePartnerSmsView; orderId: string }>
+  | Readonly<{
+      status: "matched";
+      sms: SafePartnerSmsView;
+      orderId: string;
+      /**
+       * `first` settled the order and created its Earning; `repeat` refreshed the
+       * OTP of an order that already succeeded and is still listening, touching
+       * no money.
+       */
+      mode: SmsMatchMode;
+    }>
   | Readonly<{ status: "unmatched"; sms: SafePartnerSmsView; reason: SmsUnmatchedReason }>
   | Readonly<{
       status: "ambiguous";
@@ -199,8 +211,9 @@ export class SmsIngestionService<Tx> {
     }
     const sms = insert.sms;
 
-    // 3. Match against the `waiting_sms` orders on the number, keyed on the
-    //    authoritative server-received instant.
+    // 3. Match against the orders holding the number — one awaiting its first
+    //    code, or one that already succeeded and is still listening for a repeat
+    //    — keyed on the authoritative server-received instant.
     const candidates = await matchingGateway.loadActiveOrderCandidates(
       tx,
       input.principal.partnerId,
@@ -228,13 +241,22 @@ export class SmsIngestionService<Tx> {
       });
     }
 
-    // 4. Exactly one order matched: parse the service-specific OTP.
-    const parse = parseServiceOtp(match.serviceCode, input.body);
+    // 4. Exactly one order matched: parse the service-specific OTP. The sender
+    //    rides along so a foreign-service SMS (e.g. a bank OTP landing in the
+    //    WA order window) is rejected instead of misdelivered.
+    const parse = parseServiceOtp(match.serviceCode, input.body, { sender: input.sender });
     if (parse.status === "rejected") {
       return this.audit(tx, sms, "unmatched", parse.reason, nowEpochMs);
     }
 
-    // 5. Extract succeeded: transition the order `waiting_sms → success`.
+    // 5a. Repeat OTP on an order that already succeeded and is still listening:
+    //     refresh the OTP only. No status change, no number release, and no
+    //     second Earning — money is created exactly once per order.
+    if (match.mode === "repeat") {
+      return this.applyRepeat(tx, sms, match.orderId, parse.otp, nowEpochMs, input);
+    }
+
+    // 5b. First extract: transition the order `waiting_sms → success`.
     const context = await matchingGateway.loadSuccessContext(tx, match.orderId);
     if (context === null || context.orderStatus !== "waiting_sms") {
       // The order changed since the candidate load (a concurrent success or
@@ -245,21 +267,15 @@ export class SmsIngestionService<Tx> {
     const config = await matchingGateway.loadActiveConfig(tx);
     if (config === null) throw new SmsDependencyUnavailableError();
 
+    // Success keeps the number held (no release context): the order goes on
+    // listening for a repeat OTP, and the hold is released later by completion or
+    // the expiry sweep.
     const decision = decideOrderNumberTransition({
       orderId: context.orderId,
       orderStatus: context.orderStatus,
       numberStatus: context.numberStatus,
       otpReceived: context.otpReceived,
-      command: {
-        type: "succeed",
-        release: {
-          numberEnabled: context.numberEnabled,
-          deviceStatus: context.deviceStatus,
-          deviceLastSeenAtMs: context.deviceLastSeenAtEpochMs,
-          observedAtMs: nowEpochMs,
-          heartbeatTimeoutMs: config.heartbeatTimeoutSeconds * 1000,
-        },
-      },
+      command: { type: "succeed" },
     });
     if (decision.kind !== "apply") {
       // The state machine refused the success (e.g. OTP already received, or a
@@ -312,6 +328,63 @@ export class SmsIngestionService<Tx> {
       status: "matched",
       sms: withStatus(sms, "matched", context.orderId, nowEpochMs),
       orderId: context.orderId,
+      mode: "first" as SmsMatchMode,
+    });
+  }
+
+  /**
+   * Record a repeat OTP on an already-successful, still-listening order.
+   *
+   * The listening predicate is re-checked against the freshly loaded row inside
+   * this transaction: the candidate load is a snapshot, and the hold may have
+   * been released (buyer completed, or the sweep closed the window) in between.
+   * A released or expired order no longer holds its number, so its SMS is stored
+   * for audit rather than delivered — the same fail-closed rule the first-extract
+   * path uses.
+   */
+  private async applyRepeat(
+    tx: Tx,
+    sms: SafePartnerSmsView,
+    orderId: string,
+    otpPlaintext: string,
+    nowEpochMs: number,
+    input: IngestSmsInput,
+  ): Promise<SmsIngestionResult> {
+    const repeat = await this.deps.matchingGateway.loadRepeatOtpContext(tx, orderId);
+    if (
+      repeat === null
+      || !isListeningOrder(
+        {
+          orderId: repeat.orderId,
+          orderStatus: repeat.orderStatus,
+          completedAtMs: repeat.completedAtEpochMs,
+          expiresAtMs: repeat.expiresAtEpochMs,
+        },
+        sms.receivedAtServerEpochMs,
+      )
+    ) {
+      return this.audit(tx, sms, "unmatched", "no_active_order", nowEpochMs);
+    }
+
+    const otp = encryptOtp(this.deps.cipher, otpPlaintext);
+    await this.deps.matchingGateway.applyRepeatOtp(tx, {
+      smsId: sms.id,
+      orderId: repeat.orderId,
+      partnerId: repeat.partnerId,
+      expectedOrderVersion: repeat.version,
+      otpCiphertext: otp.otpCiphertext,
+      otpKeyVersion: otp.otpKeyVersion,
+      otpFingerprint: otp.otpFingerprint,
+      operationKey: `order-repeat-otp:${encodeURIComponent(repeat.orderId)}:${sms.id}`,
+      actorRef: input.principal.deviceId,
+      nowEpochMs,
+    });
+
+    return Object.freeze({
+      status: "matched",
+      sms: withStatus(sms, "matched", repeat.orderId, nowEpochMs),
+      orderId: repeat.orderId,
+      mode: "repeat" as SmsMatchMode,
     });
   }
 

@@ -39,6 +39,12 @@ import {
  * constraints, the tenant scoping, the exactly-one matching, and the redaction
  * guarantees hold together on real storage.
  *
+ * The listening window is covered here too, because its rules are enforced by the
+ * adapter's compare-and-set rather than by the pure matcher: a success keeps its
+ * number hold, a repeat SMS inside the open window rewrites the OTP without
+ * touching money or the audit trail, and a `completedAt`-stamped order stops
+ * matching altogether.
+ *
  * Complements the unit suites rather than duplicating them:
  *  - Ciphertext / key version / rotation: `sms-otp-cipher.unit.test.ts`.
  *  - Parser keyword/candidate/Unicode/decoy/ambiguity: `sms-matching-otp.unit.test.ts`.
@@ -46,7 +52,7 @@ import {
  *    `agent-sms-endpoint.unit.test.ts` (the ingestion service is size-agnostic;
  *    the endpoint enforces `AGENT_SMS_MAX_BODY_BYTES` before it is called).
  *
- * **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.7, 19.6**
+ * **Validates: Requirements 11.1, 11.2, 11.3, 11.4, 11.5, 11.7, 13.7, 19.6**
  */
 const execFileAsync = promisify(execFile);
 const repositoryRoot = process.cwd();
@@ -63,6 +69,10 @@ const MVP_PAYOUT_IDR = 1_000;
 const OTP = "123456";
 const MATCHING_BODY = `Your WhatsApp code is ${OTP}`;
 const SENDER = "WhatsAppBusiness";
+
+/** The resend: same shape, different code — what the listening window exists for. */
+const REPEAT_OTP = "654123";
+const REPEAT_BODY = `Your WhatsApp code is ${REPEAT_OTP}`;
 
 async function deployFromEmpty(connectionString: string): Promise<void> {
   await execFileAsync(process.execPath, ["scripts/migrate-from-empty.mjs"], {
@@ -119,8 +129,11 @@ function createIngestionService(client: PartnerDatabaseClient): SmsIngestionServ
 
 /** A fresh, unique canonical Indonesian E.164 number ("+62..."), <= 20 chars. */
 function uniqueCanonicalNumber(): string {
-  let digits = "";
-  for (let i = 0; i < 9; i += 1) digits += String(randomInt(0, 10));
+  // Canonical rule: `+628` then a NON-ZERO digit, then 8 more. Drawing the
+  // first digit from 0-9 produced `+6280…` roughly one run in ten, which the
+  // domain rightly rejects — a self-inflicted flake, not a product bug.
+  let digits = String(randomInt(1, 10));
+  for (let i = 0; i < 8; i += 1) digits += String(randomInt(0, 10));
   return `+628${digits}`;
 }
 
@@ -142,8 +155,9 @@ async function createApprovedPartner(client: PartnerDatabaseClient): Promise<str
   return id;
 }
 
-/** An online simulator device with a fresh heartbeat, so a success releases the
- * number back to `available` rather than `offline`. */
+/** An online simulator device with a fresh heartbeat, so when the listening
+ * window is eventually closed the number lands back on `available` rather than
+ * `offline`. */
 async function createOnlineDevice(client: PartnerDatabaseClient, partnerId: string): Promise<string> {
   const id = randomUUID();
   await client.partnerDevice.create({
@@ -296,7 +310,7 @@ describe.runIf(hasPostgres)("SMS/OTP persistence integration (task 12.4)", () =>
   // plaintext), the correct key version is persisted, and the order succeeds
   // with exactly one pending Earning and a zero-sum ledger event.
   describe("Matched success stores encrypted SMS/OTP and never plaintext", () => {
-    it("persists ciphertext-only rows, the key version, and the released number", async () => {
+    it("persists ciphertext-only rows, the key version, and the retained number hold", async () => {
       const supply = await seedSupply(client);
       const orderId = await seedWaitingOrder(client, supply);
       const input = ingestInput(supply);
@@ -367,10 +381,116 @@ describe.runIf(hasPostgres)("SMS/OTP persistence integration (task 12.4)", () =>
       const sum = ledger.entries.reduce((total, entry) => total + entry.amountIdrSigned, 0);
       expect(sum).toBe(0);
 
-      // The number is released back to available and unbound from the order.
+      // The number hold OUTLIVES the success: `completedAt` is unset, so the
+      // order is still listening for a repeat code and keeps the number BUSY and
+      // bound to itself. Releasing here (as success used to) would put the number
+      // back on sale while a resent code for this buyer is still in flight, which
+      // is exactly how a repeat OTP gets misdelivered to the next buyer.
+      expect(order.completedAt).toBeNull();
       const number = await client.partnerNumber.findUniqueOrThrow({ where: { id: supply.numberId } });
-      expect(number.status).toBe("AVAILABLE");
-      expect(number.currentOrderId).toBeNull();
+      expect(number.status).toBe("BUSY");
+      expect(number.currentOrderId).toBe(orderId);
+    });
+  });
+
+  // Requirements 11.7, 13.7: while a successful order is still listening (hold
+  // not released, window open) a further SMS on its number matches the SAME
+  // order and refreshes the OTP only. Once the hold IS released the order stops
+  // matching entirely — the pipeline fails closed rather than reviving a closed
+  // window. Both halves are asserted against the REAL Prisma gateway, because
+  // the compare-and-set that enforces them (`status = SUCCESS AND completedAt IS
+  // NULL`) lives in the adapter, not in the pure matcher.
+  describe("Repeat OTP inside the listening window refreshes the code only", () => {
+    it("rewrites the OTP without a second Earning or a new order transition", async () => {
+      const supply = await seedSupply(client);
+      const orderId = await seedWaitingOrder(client, supply);
+
+      const first = await service.ingest(ingestInput(supply));
+      expect(first.status).toBe("matched");
+      const afterFirst = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+      const transitionsAfterFirst = await client.orderTransition.count({ where: { orderId } });
+      // The first extract IS a status edge, so it recorded exactly one transition.
+      expect(transitionsAfterFirst).toBe(1);
+
+      const repeat = await service.ingest(ingestInput(supply, { body: REPEAT_BODY }));
+
+      expect(repeat.status).toBe("matched");
+      if (repeat.status !== "matched") throw new Error("unreachable");
+      expect(repeat.orderId).toBe(orderId);
+      expect(repeat.mode).toBe("repeat");
+
+      // The stored OTP is the NEWER code: fingerprint and ciphertext both moved,
+      // and the envelope is still stamped with the active key version.
+      const order = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.otpFingerprint).toBe(cipher.fingerprint(REPEAT_OTP));
+      expect(order.otpFingerprint).not.toBe(afterFirst.otpFingerprint);
+      expect(Buffer.from(order.otpCiphertext ?? Buffer.alloc(0)).equals(
+        Buffer.from(afterFirst.otpCiphertext ?? Buffer.alloc(0)),
+      )).toBe(false);
+      expect(order.otpKeyVersion).toBe(CIPHER_KEY_VERSION);
+      expect(
+        await cipher.decrypt({
+          ciphertext: Buffer.from(order.otpCiphertext ?? Buffer.alloc(0)),
+          keyVersion: order.otpKeyVersion ?? 0,
+        }),
+      ).toBe(REPEAT_OTP);
+
+      // Status untouched and the hold still open — the order goes on listening.
+      expect(order.status).toBe("SUCCESS");
+      expect(order.completedAt).toBeNull();
+      expect(order.succeededAt?.getTime()).toBe(afterFirst.succeededAt?.getTime());
+
+      // Money is created exactly once per order: no second Earning.
+      const earnings = await client.partnerEarning.findMany({ where: { orderId } });
+      expect(earnings).toHaveLength(1);
+      expect(earnings[0].amountIdr).toBe(MVP_PAYOUT_IDR);
+
+      // The repeat SMS is bound to the same order for audit…
+      const sms = await client.partnerSms.findUniqueOrThrow({ where: { id: repeat.sms.id } });
+      expect(sms.matchStatus).toBe("MATCHED");
+      expect(sms.matchedOrderId).toBe(orderId);
+      expect(sms.extractedAt).not.toBeNull();
+      // …but NO new `order_transitions` row: that table records status edges, and
+      // a repeat deliberately changes no status. A row here would forge a
+      // success→success edge in the audit trail.
+      expect(await client.orderTransition.count({ where: { orderId } })).toBe(1);
+    });
+
+    it("stores a post-completion SMS unmatched and never overwrites the delivered OTP", async () => {
+      const supply = await seedSupply(client);
+      const orderId = await seedWaitingOrder(client, supply);
+      const first = await service.ingest(ingestInput(supply));
+      expect(first.status).toBe("matched");
+
+      // Close the window the way buyer completion / the expiry sweep does: stamp
+      // `completedAt`. From here the order holds nothing, so it must stop being a
+      // matching candidate — otherwise a late resend would keep rewriting an OTP
+      // the buyer has already consumed.
+      await client.partnerOrder.update({
+        where: { id: orderId },
+        data: { completedAt: new Date() },
+      });
+      const beforeLate = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+
+      const late = await service.ingest(ingestInput(supply, { body: REPEAT_BODY }));
+
+      expect(late.status).toBe("unmatched");
+      if (late.status !== "unmatched") throw new Error("unreachable");
+      expect(late.reason).toBe("no_active_order");
+      const sms = await client.partnerSms.findUniqueOrThrow({ where: { id: late.sms.id } });
+      expect(sms.matchStatus).toBe("UNMATCHED");
+      expect(sms.matchedOrderId).toBeNull();
+      expect(sms.extractedAt).toBeNull();
+
+      // The delivered OTP is exactly as completion left it.
+      const order = await client.partnerOrder.findUniqueOrThrow({ where: { id: orderId } });
+      expect(order.otpFingerprint).toBe(cipher.fingerprint(OTP));
+      expect(order.otpFingerprint).toBe(beforeLate.otpFingerprint);
+      expect(Buffer.from(order.otpCiphertext ?? Buffer.alloc(0)).equals(
+        Buffer.from(beforeLate.otpCiphertext ?? Buffer.alloc(0)),
+      )).toBe(true);
+      expect(order.status).toBe("SUCCESS");
+      expect(await client.partnerEarning.count({ where: { orderId } })).toBe(1);
     });
   });
 

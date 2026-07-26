@@ -379,7 +379,17 @@ export interface ReconciliationGateway {
     readonly limit: number;
     readonly afterId: string | null;
   }): Promise<readonly string[]>;
-  /** Load one tenant's financial + operational reconciliation state. */
+  /**
+   * Load one tenant's financial + operational reconciliation state.
+   *
+   * `nowEpochMs` is the batch's single server-observed instant. It is needed
+   * because "holds its number" is no longer a pure status question: a `success`
+   * order keeps its number while its listening window is open, which the
+   * adapter must evaluate against a clock. Passing the job's instant keeps every
+   * partner in a batch judged at the same moment, so the detector's findings —
+   * and therefore the open-issue dedupe — stay reproducible. When omitted the
+   * adapter falls back to its own read snapshot's instant.
+   */
   loadPartnerState(partnerId: string): Promise<PartnerReconciliationState>;
   /**
    * Persist the tenant's classified findings, deduping each against an existing

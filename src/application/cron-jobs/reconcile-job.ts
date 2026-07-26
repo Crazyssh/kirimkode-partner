@@ -74,6 +74,10 @@ export class ReconcileJob implements BatchJob {
 
     let processed = 0;
     for (const partnerId of partnerIds) {
+      // Hand the batch instant to the projection too: whether a settled order
+      // still holds its number (its listening window is open) is a clock
+      // question, and judging it on the same `now` the detector uses keeps the
+      // whole run consistent.
       const state = await this.deps.gateway.loadPartnerState(partnerId);
       const findings = reconcilePartner({
         ...state,

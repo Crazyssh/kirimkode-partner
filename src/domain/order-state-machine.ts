@@ -37,7 +37,13 @@ interface TerminalCommandContext {
 export type OrderTransitionCommand =
   | { type: "reserve" }
   | { type: "activate" }
-  | ({ type: "succeed" } & TerminalCommandContext)
+  /**
+   * Success carries NO release context: it no longer releases the number. The
+   * order keeps holding it while it listens for a repeat OTP, and the hold is
+   * released exactly once later — by the buyer completing the order or by the
+   * expiry sweep (see `decideListeningHoldRelease` in `order-listening-window`).
+   */
+  | { type: "succeed" }
   | ({
       type: "cancel";
       reason: string;
@@ -328,6 +334,12 @@ export function decideOrderNumberTransition(
   } else if (target === "waiting_sms") {
     expectedNumberStatus = "reserved";
     nextNumberStatus = "busy";
+  } else if (target === "success") {
+    // Success settles the money but keeps the number held: the order stays bound
+    // to it for the listening window so a repeat OTP can still arrive, and so the
+    // number cannot be resold while a resent SMS for this buyer is in flight.
+    expectedNumberStatus = "busy";
+    nextNumberStatus = input.numberStatus;
   } else if (
     isTerminalOrderStatus(target) &&
     input.orderStatus !== "created"

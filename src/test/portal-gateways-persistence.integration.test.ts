@@ -227,8 +227,11 @@ async function createApprovedPartner(client: PartnerDatabaseClient): Promise<See
 
 /** A fresh, unique canonical Indonesian E.164 number ("+628..."), <= 20 chars. */
 function uniqueCanonicalNumber(): string {
-  let digits = "";
-  for (let i = 0; i < 9; i += 1) digits += String(randomInt(0, 10));
+  // Canonical rule: `+628` then a NON-ZERO digit, then 8 more. Drawing the
+  // first digit from 0-9 produced `+6280…` roughly one run in ten, which the
+  // domain rightly rejects — a self-inflicted flake, not a product bug.
+  let digits = String(randomInt(1, 10));
+  for (let i = 0; i < 8; i += 1) digits += String(randomInt(0, 10));
   return `+628${digits}`;
 }
 

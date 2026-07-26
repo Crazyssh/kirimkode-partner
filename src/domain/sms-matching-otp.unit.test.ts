@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   decideSmsIngress,
+  isForeignServiceSender,
   matchSmsToActiveOrder,
   parseServiceOtp,
   type SmsIngressPolicyInput,
@@ -59,24 +60,51 @@ const waitingOrder = (overrides: Partial<SmsOrderCandidate> = {}): SmsOrderCandi
   status: "waiting_sms",
   windowStartsAtMs: 1_000,
   windowEndsAtMs: 2_000,
+  completedAtMs: null,
   ...overrides,
 });
 
 // **Validates: Requirements 11.4, 11.5**
 describe("Task 5.4 exact-one active order matcher", () => {
   it("matches exactly one waiting order for the number within the inclusive window", () => {
+    // `mode: "first"` marks the extract that settles the order and creates its
+    // money, as opposed to a repeat that only refreshes the OTP.
     expect(matchSmsToActiveOrder({
       numberId: "number-a", receivedAtMs: 1_000, orders: [waitingOrder()],
-    })).toEqual({ status: "matched", orderId: "order-a", serviceCode: "wa" });
+    })).toEqual({ status: "matched", orderId: "order-a", serviceCode: "wa", mode: "first" });
     expect(matchSmsToActiveOrder({
       numberId: "number-a", receivedAtMs: 2_000, orders: [waitingOrder()],
-    })).toEqual({ status: "matched", orderId: "order-a", serviceCode: "wa" });
+    })).toEqual({ status: "matched", orderId: "order-a", serviceCode: "wa", mode: "first" });
+  });
+
+  it("matches a settled order that is still listening, as a repeat", () => {
+    // The order already succeeded but has not released its number hold, so a
+    // resent code belongs to it — and must be marked `repeat` so the pipeline
+    // refreshes the OTP instead of settling the order (and its money) twice.
+    expect(matchSmsToActiveOrder({
+      numberId: "number-a",
+      receivedAtMs: 1_500,
+      orders: [waitingOrder({ status: "success", completedAtMs: null })],
+    })).toEqual({ status: "matched", orderId: "order-a", serviceCode: "wa", mode: "repeat" });
+  });
+
+  it("stops matching a successful order once its hold was released", () => {
+    // `completedAt` stamped means the number went back on sale: a later SMS must
+    // never be delivered to this order, even inside its old window.
+    expect(matchSmsToActiveOrder({
+      numberId: "number-a",
+      receivedAtMs: 1_500,
+      orders: [waitingOrder({ status: "success", completedAtMs: 1_200 })],
+    })).toEqual({ status: "unmatched", candidateOrderIds: [] });
   });
 
   it("reports unmatched when status, number, time, or window is ineligible", () => {
     const orders = [
       waitingOrder({ id: "wrong-number", numberId: "number-b" }),
-      waitingOrder({ id: "terminal", status: "success" }),
+      // A settled order whose hold was already released holds nothing.
+      waitingOrder({ id: "closed-success", status: "success", completedAtMs: 500 }),
+      waitingOrder({ id: "cancelled", status: "cancelled", completedAtMs: null }),
+      waitingOrder({ id: "timed-out", status: "timeout", completedAtMs: null }),
       waitingOrder({ id: "future", windowStartsAtMs: 2_001 }),
       waitingOrder({ id: "invalid-window", windowStartsAtMs: 3_000, windowEndsAtMs: 2_000 }),
     ];
@@ -148,18 +176,57 @@ describe("Task 5.4 WhatsApp OTP parser", () => {
   it("does not treat a word that merely contains a decoy label as a decoy", () => {
     // `iPhone` ends with `phone`, `update` with `date`, `hotel` with `tel`;
     // none is a standalone phone/date label, so the adjacent OTP is delivered.
-    expect(parseServiceOtp("wa", "Kode iPhone 123456")).toEqual({
+    expect(parseServiceOtp("wa", "Kode WhatsApp iPhone 123456")).toEqual({
       status: "matched", otp: "123456",
     });
-    expect(parseServiceOtp("wa", "Kode iPhone: 123456")).toEqual({
+    expect(parseServiceOtp("wa", "Kode WhatsApp iPhone: 123456")).toEqual({
       status: "matched", otp: "123456",
     });
-    expect(parseServiceOtp("wa", "Kode hotel 123456")).toEqual({
+    expect(parseServiceOtp("wa", "Kode WhatsApp hotel 123456")).toEqual({
       status: "matched", otp: "123456",
     });
     expect(parseServiceOtp("wa", "WhatsApp update code: 123456")).toEqual({
       status: "matched", otp: "123456",
     });
+  });
+
+  it("requires the WhatsApp brand word — generic OTP words no longer qualify", () => {
+    // Real foreign-service OTPs that DO contain 'kode'/'code'/'verification'
+    // plus a six-digit code: without the brand word they must never match.
+    expect(parseServiceOtp("wa", "Kode BCA Anda: 482901")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("wa", "G-123456 is your Google verification code")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("wa", "Verifikasi akun: 482901")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+  });
+
+  it("rejects a sender that clearly names another service before parsing the body", () => {
+    // Even a body that would parse (brand word + one candidate) is refused
+    // when the sender belongs to another service.
+    const body = "Kode WhatsApp Anda: 718-891";
+    for (const sender of ["InfoBCA", "Telegram", "GOOGLE", "Gojek-Info"]) {
+      expect(parseServiceOtp("wa", body, { sender })).toEqual({
+        status: "rejected", reason: "foreign_sender",
+      });
+    }
+    // Legitimate WhatsApp-route senders pass through.
+    for (const sender of ["WhatsApp", "WhatsAppBusiness", "+6289911223344", ""]) {
+      expect(parseServiceOtp("wa", body, { sender })).toEqual({
+        status: "matched", otp: "718891",
+      });
+    }
+  });
+
+  it("isForeignServiceSender folds case and never flags empty or numeric senders", () => {
+    expect(isForeignServiceSender("InfoBCA")).toBe(true);
+    expect(isForeignServiceSender("TELEGRAM")).toBe(true);
+    expect(isForeignServiceSender("WhatsApp")).toBe(false);
+    expect(isForeignServiceSender("+6281234567890")).toBe(false);
+    expect(isForeignServiceSender("")).toBe(false);
   });
 
   it("still rejects a standalone phone/date label immediately before the sole candidate", () => {
@@ -168,6 +235,47 @@ describe("Task 5.4 WhatsApp OTP parser", () => {
       status: "rejected", reason: "decoy_candidate",
     });
     expect(parseServiceOtp("wa", "WhatsApp verification tel: 123456")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+  });
+
+  it("accepts the real WhatsApp dashed wire format and normalizes it to six digits", () => {
+    // Verbatim real-world WhatsApp Business verification SMS (code as 718-891).
+    const realBusiness = [
+      "Akun WhatsApp Business Anda sedang didaftarkan di perangkat baru",
+      "",
+      "Jangan bagikan kode dengan siapa pun",
+      "Kode WhatsApp Business Anda: 718-891",
+      "rJbA/XP1K+V",
+    ].join("\n");
+    expect(parseServiceOtp("wa", realBusiness)).toEqual({ status: "matched", otp: "718891" });
+    expect(
+      parseServiceOtp("wa", "Your WhatsApp code: 123-456\n\nDon't share this code with others"),
+    ).toEqual({ status: "matched", otp: "123456" });
+  });
+
+  it("never treats a hyphenated pair inside a longer chain or number as a candidate", () => {
+    for (const body of [
+      "WhatsApp code hubungi 0812-345-6789", // phone chain: every pair chained
+      "WhatsApp code 555-123-4567",
+      "WhatsApp code 0718-891", // digit touches the pair on the left
+      "WhatsApp code 718-8912", // digit touches the pair on the right
+    ]) {
+      expect(parseServiceOtp("wa", body)).toEqual({
+        status: "rejected", reason: "no_candidate",
+      });
+    }
+    // A real dashed code stays deliverable beside a hyphenated phone decoy.
+    expect(
+      parseServiceOtp("wa", "WhatsApp code 718-891, phone 0812-345-6789"),
+    ).toEqual({ status: "matched", otp: "718891" });
+  });
+
+  it("applies the ambiguity and decoy guards to dashed candidates too", () => {
+    expect(parseServiceOtp("wa", "WhatsApp code 123-456 backup 654321")).toEqual({
+      status: "rejected", reason: "ambiguous_candidates",
+    });
+    expect(parseServiceOtp("wa", "WhatsApp verification tel: 123-456")).toEqual({
       status: "rejected", reason: "decoy_candidate",
     });
   });

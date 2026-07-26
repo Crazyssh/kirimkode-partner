@@ -62,6 +62,12 @@ interface OrderSpec {
   readonly status: string;
   readonly windowStartsAtMs: number;
   readonly windowEndsAtMs: number;
+  /**
+   * When a successful order's number hold was released. Null means it is still
+   * listening and still holds the number, so a repeat OTP may still match it;
+   * a stamped instant means the number went back on sale.
+   */
+  readonly completedAtMs: number | null;
 }
 
 const orderSpecArbitrary: fc.Arbitrary<OrderSpec> = fc.record({
@@ -70,6 +76,9 @@ const orderSpecArbitrary: fc.Arbitrary<OrderSpec> = fc.record({
   status: statusArbitrary,
   windowStartsAtMs: timeArbitrary,
   windowEndsAtMs: timeArbitrary,
+  // Both dispositions are generated for every status, so a `success` order is
+  // sometimes listening and sometimes closed.
+  completedAtMs: fc.oneof(fc.constant(null), fc.integer({ min: 0, max: 20 })),
 });
 
 // Assign IDs by index so every candidate ID is unique; this keeps
@@ -82,16 +91,24 @@ function withIds(specs: readonly OrderSpec[]): readonly SmsOrderCandidate[] {
 }
 
 // Independent reference for the acceptance criteria (requirement 11.4): an order
-// is a genuine match iff it belongs to the SMS's number, is awaiting an SMS, and
-// the finite receive instant falls inside its finite, non-inverted window.
+// is a genuine match iff it belongs to the SMS's number, still holds that number,
+// and the finite receive instant falls inside its finite, non-inverted window.
+//
+// Two shapes hold a number: an order awaiting its FIRST code (`waiting_sms`), and
+// a settled order still LISTENING for a repeat (`success` whose hold was never
+// released). Every other status — including a `success` whose `completedAt` is
+// stamped — holds nothing and must never be selected.
 function isTrueMatch(
   order: SmsOrderCandidate,
   numberId: string,
   receivedAtMs: number,
 ): boolean {
+  const holdsNumber =
+    order.status === "waiting_sms" ||
+    (order.status === "success" && order.completedAtMs === null);
   return (
     order.numberId === numberId &&
-    order.status === "waiting_sms" &&
+    holdsNumber &&
     Number.isFinite(receivedAtMs) &&
     Number.isFinite(order.windowStartsAtMs) &&
     Number.isFinite(order.windowEndsAtMs) &&
@@ -136,6 +153,11 @@ describe("Property 16: matching SMS tidak pernah ambigu", () => {
             if (result.status === "matched") {
               expect(result.orderId).toBe(trueMatches[0].id);
               expect(result.serviceCode).toBe(trueMatches[0].serviceCode);
+              // The mode must follow the holder's shape: settling the order once
+              // vs refreshing the OTP of one that already settled.
+              expect(result.mode).toBe(
+                trueMatches[0].status === "success" ? "repeat" : "first",
+              );
             }
           } else {
             expect(result.status).toBe("ambiguous");
@@ -150,7 +172,7 @@ describe("Property 16: matching SMS tidak pernah ambigu", () => {
           }
 
           // Core invariant, stated both ways: an SMS is associated to an order
-          // (an OTP target is chosen) IFF exactly one waiting_sms order matched.
+          // (an OTP target is chosen) IFF exactly one number-holding order matched.
           expect(selectsAnOrder(result)).toBe(trueMatches.length === 1);
         },
       ),

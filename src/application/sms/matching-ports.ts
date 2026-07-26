@@ -98,6 +98,51 @@ export interface SmsOrderCandidateRow {
   readonly status: OrderStatus;
   readonly windowStartsAtMs: number;
   readonly windowEndsAtMs: number;
+  /**
+   * When a successful order's number hold was released. A `success` candidate is
+   * only eligible for a repeat OTP while this is null and its window is open
+   * (the listening window); once released it no longer holds the number.
+   */
+  readonly completedAtMs: number | null;
+}
+
+/**
+ * The projection a repeat OTP needs: an order that already succeeded and is
+ * still listening. No money is touched on this path, so only the identity, the
+ * concurrency version, and the state needed to prove the order still holds its
+ * number are loaded.
+ */
+export interface OrderRepeatOtpContext {
+  readonly orderId: string;
+  readonly partnerId: string;
+  readonly numberId: string;
+  readonly version: number;
+  readonly orderStatus: OrderStatus;
+  /** Null while the order still holds its number after success. */
+  readonly completedAtEpochMs: number | null;
+  readonly expiresAtEpochMs: number;
+}
+
+/**
+ * Everything the gateway needs to record one repeat OTP atomically: overwrite
+ * the order's encrypted OTP with the newer code (compare-and-set on version so a
+ * concurrent completion or sweep wins), and mark the SMS `matched` against the
+ * same order. Deliberately does NOT touch order status, the number, the Earning,
+ * or the ledger — the order already settled, and money is created exactly once
+ * per order.
+ */
+export interface ApplySmsRepeatOtpInput {
+  readonly smsId: string;
+  readonly orderId: string;
+  readonly partnerId: string;
+  readonly expectedOrderVersion: number;
+  readonly otpCiphertext: Uint8Array;
+  readonly otpKeyVersion: number;
+  readonly otpFingerprint: string;
+  readonly operationKey: string;
+  /** Raw actor reference; the adapter persists only its hash. */
+  readonly actorRef: string;
+  readonly nowEpochMs: number;
 }
 
 /**
@@ -210,7 +255,11 @@ export interface SmsMatchingGateway<Tx> {
   /** Load the immutable config values the success number-release needs. */
   loadActiveConfig(tx: Tx): Promise<SmsMatchingConfig | null>;
 
-  /** Load the `waiting_sms` order candidates on a number for matching. */
+  /**
+   * Load the order candidates on a number for matching: those awaiting their
+   * first code (`waiting_sms`) and those still listening for a repeat
+   * (`success` with no released hold).
+   */
   loadActiveOrderCandidates(
     tx: Tx,
     partnerId: string,
@@ -228,6 +277,17 @@ export interface SmsMatchingGateway<Tx> {
    * matches no row.
    */
   applySuccess(tx: Tx, input: ApplySmsSuccessInput): Promise<void>;
+
+  /** Load the repeat-OTP context for an order that already succeeded. */
+  loadRepeatOtpContext(tx: Tx, orderId: string): Promise<OrderRepeatOtpContext | null>;
+
+  /**
+   * Record a repeat OTP on an already-successful, still-listening order: newer
+   * OTP on the order and the SMS `→matched`, in one transaction. Touches no
+   * money and no number state. Throws {@link SmsSuccessContentionError} when the
+   * compare-and-set matches no row (the hold was released concurrently).
+   */
+  applyRepeatOtp(tx: Tx, input: ApplySmsRepeatOtpInput): Promise<void>;
 
   /**
    * Mark a stored SMS `unmatched` or `ambiguous` (no OTP delivered, order left

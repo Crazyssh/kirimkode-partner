@@ -234,8 +234,11 @@ async function createActiveOffer(client: PartnerDatabaseClient, partnerId: strin
 }
 
 function uniqueCanonicalNumber(): string {
-  let digits = "";
-  for (let i = 0; i < 9; i += 1) digits += String(randomInt(0, 10));
+  // Canonical rule: `+628` then a NON-ZERO digit, then 8 more. Drawing the
+  // first digit from 0-9 produced `+6280…` roughly one run in ten, which the
+  // domain rightly rejects — a self-inflicted flake, not a product bug.
+  let digits = String(randomInt(1, 10));
+  for (let i = 0; i < 8; i += 1) digits += String(randomInt(0, 10));
   return `+628${digits}`;
 }
 
@@ -1350,6 +1353,170 @@ describe.runIf(hasPostgres)(
           orderBy: { id: "asc" },
         });
         expect(payoutsAfter).toEqual(payoutsBefore);
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // The listening window (repeat OTP) decouples the number hold from the
+    // terminal status: a `success` order keeps its number until `completedAt` is
+    // stamped or its window closes. The reconciler's projection must therefore
+    // count a listening order as its number's active holder — otherwise every
+    // legitimately held number looks abandoned and mints a false
+    // `order_number_mismatch`. The old safety net must survive intact: once the
+    // order is completed or its window has closed, a still-`busy` number is a
+    // real leaked hold and must still be reported.
+    // -----------------------------------------------------------------------
+    describe("Reconciliation treats a listening order as holding its number", () => {
+      /**
+       * Seed a tenant whose single SUCCESS order sits on a BUSY number bound via
+       * `currentOrderId` — the real shape of a post-success hold. The financial
+       * side is deliberately complete and consistent (immutable snapshot +
+       * pending Earning + zero-sum `order-success` ledger, device freshly seen),
+       * so the ONLY findings this tenant can produce are the number-centric ones
+       * under test. `expiresAt`/`completedAt` are the only variables.
+       */
+      async function seedSettledOrderOnBusyNumber(options: {
+        readonly expiresAt: Date;
+        readonly completedAt: Date | null;
+      }): Promise<{ partnerId: string; orderId: string; numberId: string }> {
+        const amount = 1_000;
+        const partnerId = await createApprovedPartner(client);
+        const deviceId = await createDevice(client, partnerId, {
+          status: "ONLINE",
+          lastSeenAtEpochMs: BASE_EPOCH_MS,
+        });
+        const offerId = await createActiveOffer(client, partnerId);
+        const { numberId, canonicalNumber } = await createNumber(
+          client,
+          partnerId,
+          deviceId,
+          { status: "BUSY" },
+        );
+        const orderId = randomUUID();
+        await client.partnerOrder.create({
+          data: {
+            id: orderId,
+            buyerOrderRef: `buyer-${orderId}`,
+            buyerAccountRef: `acct-${randomUUID()}`,
+            partnerId,
+            numberId,
+            offerId,
+            status: "SUCCESS",
+            expiresAt: options.expiresAt,
+            reservedAt: new Date(BASE_EPOCH_MS - 2 * HOUR_MS),
+            succeededAt: new Date(BASE_EPOCH_MS - HOUR_MS),
+            terminalAt: new Date(BASE_EPOCH_MS - HOUR_MS),
+            completedAt: options.completedAt,
+          },
+        });
+        // The number pointing back at the order IS the hold (currentOrderId's FK
+        // needs the order to exist, so this is a follow-up update).
+        await client.partnerNumber.update({
+          where: { id: numberId },
+          data: { currentOrderId: orderId },
+        });
+        await client.orderSnapshot.create({
+          data: {
+            orderId,
+            serviceCode: "wa",
+            countryCode: "ID",
+            operatorCode: "any",
+            canonicalNumber,
+            basePriceIdr: 1_000,
+            retailPriceIdr: 1_400,
+            payoutIdr: amount,
+            platformMarginIdr: 400,
+            currency: "IDR",
+            configVersion: 1,
+          },
+        });
+        await client.partnerEarning.create({
+          data: {
+            id: randomUUID(),
+            partnerId,
+            orderId,
+            amountIdr: amount,
+            status: "PENDING",
+            availableAt: new Date(BASE_EPOCH_MS + DAY_MS),
+          },
+        });
+        await client.ledgerTransaction.create({
+          data: {
+            partnerId,
+            eventType: "ORDER_SUCCESS",
+            eventKey: `order-success:${orderId}`,
+            referenceType: "order",
+            referenceId: orderId,
+            entries: {
+              create: [
+                { bucket: "PLATFORM_PARTNER_PAYABLE", amountIdrSigned: -amount },
+                { bucket: "PARTNER_PENDING", amountIdrSigned: amount },
+              ],
+            },
+          },
+        });
+        return { partnerId, orderId, numberId };
+      }
+
+      /** Reconcile the whole platform at `BASE_EPOCH_MS` and return this
+       * tenant's persisted issues. */
+      async function reconcileAndLoadIssues(partnerId: string) {
+        const clock = new MutableClock(BASE_EPOCH_MS);
+        const job = new ReconcileJob({
+          gateway: new PrismaReconciliationGateway(client),
+          clock,
+        });
+        await runToCompletion(makeRunner(client, clock), job);
+        return client.reconciliationIssue.findMany({ where: { partnerId } });
+      }
+
+      it("reports NO issue for a listening order still holding its busy number", async () => {
+        // success + completedAt null + window still open => still listening, so
+        // the busy number has exactly one active holder and nothing is wrong.
+        const seeded = await seedSettledOrderOnBusyNumber({
+          expiresAt: new Date(BASE_EPOCH_MS + 20 * 60_000),
+          completedAt: null,
+        });
+
+        expect(await reconcileAndLoadIssues(seeded.partnerId)).toHaveLength(0);
+      });
+
+      it("still reports a busy number left behind by a COMPLETED success order", async () => {
+        // The hold was released (completedAt stamped) but the number stayed
+        // busy: a genuine leak the reconciler must keep catching. Only
+        // `completedAt` differs from the listening case above.
+        const seeded = await seedSettledOrderOnBusyNumber({
+          expiresAt: new Date(BASE_EPOCH_MS + 20 * 60_000),
+          completedAt: new Date(BASE_EPOCH_MS - 30 * 60_000),
+        });
+
+        const issues = await reconcileAndLoadIssues(seeded.partnerId);
+        expect(issues).toHaveLength(1);
+        expect(issues[0].type).toBe("ORDER_NUMBER_MISMATCH");
+        expect(issues[0].referenceId).toBe(seeded.numberId);
+        expect(issues[0].detailsSafeJson).toMatchObject({
+          detector: "number_missing_active_order",
+          numberStatus: "busy",
+          activeOrderCount: 0,
+        });
+      });
+
+      it("reports nothing for an expired window whose hold has not been released yet", async () => {
+        // Holding is a fact about the write that RELEASES it, and that release
+        // compare-and-sets on `success` + `completedAt IS NULL` — the deadline is
+        // not part of it. Between a window closing and the ~1-minute sweep
+        // actually closing it, the busy number is still legitimately held; judging
+        // it by `expiresAt` would mint durable issues (which block financial
+        // operations) for state that is perfectly consistent. A permanently broken
+        // sweep is job liveness, not state inconsistency, and belongs to a
+        // job-health signal instead.
+        const seeded = await seedSettledOrderOnBusyNumber({
+          expiresAt: new Date(BASE_EPOCH_MS - 60_000),
+          completedAt: null,
+        });
+
+        const issues = await reconcileAndLoadIssues(seeded.partnerId);
+        expect(issues).toHaveLength(0);
       });
     });
   },

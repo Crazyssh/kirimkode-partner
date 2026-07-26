@@ -1,7 +1,9 @@
 import { $Enums } from "@/generated/prisma";
 
 import type {
+  ApplySmsRepeatOtpInput,
   ApplySmsSuccessInput,
+  OrderRepeatOtpContext,
   OrderSuccessContext,
   SmsAuditMatchStatus,
   SmsMatchingConfig,
@@ -136,7 +138,14 @@ export class PrismaPartnerSmsMatchingGateway
       where: {
         partnerId,
         numberId,
-        status: $Enums.PartnerOrderStatus.WAITING_SMS,
+        // Orders that still hold this number: one awaiting its first code, or one
+        // that already succeeded and has not released its hold yet (listening for
+        // a repeat OTP). The pure matcher re-checks the window, so expiry is
+        // decided there rather than duplicated in SQL.
+        OR: [
+          { status: $Enums.PartnerOrderStatus.WAITING_SMS },
+          { status: $Enums.PartnerOrderStatus.SUCCESS, completedAt: null },
+        ],
       },
       select: {
         id: true,
@@ -145,6 +154,7 @@ export class PrismaPartnerSmsMatchingGateway
         waitingAt: true,
         createdAt: true,
         expiresAt: true,
+        completedAt: true,
         snapshot: { select: { serviceCode: true } },
       },
     });
@@ -158,6 +168,7 @@ export class PrismaPartnerSmsMatchingGateway
       // order's timeout expiry.
       windowStartsAtMs: (order.waitingAt ?? order.createdAt).getTime(),
       windowEndsAtMs: order.expiresAt.getTime(),
+      completedAtMs: epochMsOrNull(order.completedAt),
       serviceCode: order.snapshot?.serviceCode ?? "",
     }));
   }
@@ -330,6 +341,76 @@ export class PrismaPartnerSmsMatchingGateway
         operationKey: `${input.operationKey}:number`,
       },
     });
+  }
+
+  async loadRepeatOtpContext(
+    tx: PartnerTransactionClient,
+    orderId: string,
+  ): Promise<OrderRepeatOtpContext | null> {
+    const order = await tx.partnerOrder.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        partnerId: true,
+        numberId: true,
+        version: true,
+        status: true,
+        completedAt: true,
+        expiresAt: true,
+      },
+    });
+    if (order === null) return null;
+    return {
+      orderId: order.id,
+      partnerId: order.partnerId,
+      numberId: order.numberId,
+      version: order.version,
+      orderStatus: ORDER_STATUS_FROM_DB[order.status],
+      completedAtEpochMs: epochMsOrNull(order.completedAt),
+      expiresAtEpochMs: order.expiresAt.getTime(),
+    };
+  }
+
+  async applyRepeatOtp(
+    tx: PartnerTransactionClient,
+    input: ApplySmsRepeatOtpInput,
+  ): Promise<void> {
+    const now = new Date(input.nowEpochMs);
+
+    // 1. Overwrite the order's OTP with the newer code. The compare-and-set pins
+    //    the version AND the listening predicate (still SUCCESS, hold not yet
+    //    released), so a concurrent completion or expiry sweep wins the race and
+    //    this repeat is rejected rather than reviving a closed window. The
+    //    previous code stays recoverable: every SMS row keeps its own ciphertext.
+    const updatedOrder = await tx.partnerOrder.updateMany({
+      where: {
+        id: input.orderId,
+        partnerId: input.partnerId,
+        version: input.expectedOrderVersion,
+        status: $Enums.PartnerOrderStatus.SUCCESS,
+        completedAt: null,
+      },
+      data: {
+        otpCiphertext: Buffer.from(input.otpCiphertext),
+        otpKeyVersion: input.otpKeyVersion,
+        otpFingerprint: input.otpFingerprint,
+        version: { increment: 1 },
+      },
+    });
+    if (updatedOrder.count !== 1) throw new SmsSuccessContentionError();
+
+    // 2. Associate this SMS with the same order. No order transition row is
+    //    written: the order's status did not change, and `order_transitions` is
+    //    keyed on a status edge.
+    const matchedSms = await tx.partnerSms.updateMany({
+      where: { id: input.smsId, matchStatus: $Enums.SmsMatchStatus.PENDING },
+      data: {
+        matchStatus: $Enums.SmsMatchStatus.MATCHED,
+        matchedOrderId: input.orderId,
+        extractedAt: now,
+      },
+    });
+    if (matchedSms.count !== 1) throw new SmsSuccessContentionError();
   }
 
   async markSmsAudited(

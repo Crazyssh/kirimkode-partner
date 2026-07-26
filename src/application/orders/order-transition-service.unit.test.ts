@@ -12,6 +12,7 @@ import {
 import { OrderTransitionService } from "./order-transition-service";
 import {
   TerminalTransitionContentionError,
+  type ApplyListeningHoldReleaseInput,
   type ApplyTerminalTransitionInput,
   type OrderOperationsConfig,
   type OrderTransitionContext,
@@ -79,6 +80,8 @@ function context(overrides: Partial<OrderTransitionContext> = {}): OrderTransiti
     numberEnabled: true,
     deviceStatus: "online",
     deviceLastSeenAtEpochMs: NOW,
+    completedAtEpochMs: null,
+    numberCurrentOrderId: "11111111-1111-4111-8111-111111111111",
     ...overrides,
   };
 }
@@ -87,6 +90,7 @@ class FakeTransitionGateway implements OrderTransitionGateway<Tx> {
   config: OrderOperationsConfig | null = CONFIG;
   ctx: OrderTransitionContext | null = context();
   readonly applied: ApplyTerminalTransitionInput[] = [];
+  readonly completions: ApplyListeningHoldReleaseInput[] = [];
   contention = false;
 
   async loadActiveConfig(): Promise<OrderOperationsConfig | null> {
@@ -98,6 +102,10 @@ class FakeTransitionGateway implements OrderTransitionGateway<Tx> {
   async applyTerminalTransition(_tx: Tx, input: ApplyTerminalTransitionInput): Promise<void> {
     if (this.contention) throw new TerminalTransitionContentionError();
     this.applied.push(input);
+  }
+  async applyListeningHoldRelease(_tx: Tx, input: ApplyListeningHoldReleaseInput): Promise<void> {
+    if (this.contention) throw new TerminalTransitionContentionError();
+    this.completions.push(input);
   }
 }
 
@@ -120,6 +128,19 @@ function cancelInput(overrides: Record<string, unknown> = {}) {
     actorRef: "main-actor",
     ...overrides,
   } as Parameters<OrderTransitionService<Tx>["cancel"]>[0];
+}
+
+function completeInput(overrides: Record<string, unknown> = {}) {
+  return {
+    orderId: "11111111-1111-4111-8111-111111111111",
+    principalId: "main",
+    idempotencyKey: "key-1",
+    method: "POST",
+    path: "/api/internal/v1/orders/x/complete",
+    trigger: "buyer_complete",
+    actorRef: "main-actor",
+    ...overrides,
+  } as Parameters<OrderTransitionService<Tx>["complete"]>[0];
 }
 
 function timeoutInput(overrides: Record<string, unknown> = {}) {
@@ -390,5 +411,177 @@ describe("OrderTransitionService.fail", () => {
     const second = await service.fail(failInput());
     expect(second).toEqual(first);
     expect(gateway.applied).toHaveLength(1);
+  });
+});
+
+/**
+ * Completion closes a successful order's listening window and releases its number
+ * hold. The order stays `success` — the money settled when its first OTP arrived
+ * — so completion moves none of it and writes no status edge.
+ *
+ * **Validates: Requirements 12.4, 12.5**
+ */
+describe("OrderTransitionService.complete", () => {
+  let gateway: FakeTransitionGateway;
+  let store: FakeStore;
+  let service: OrderTransitionService<Tx>;
+
+  /** A settled order still holding its number, with the window still open. */
+  const listeningCtx = (overrides: Partial<OrderTransitionContext> = {}) =>
+    context({
+      orderStatus: "success",
+      numberStatus: "busy",
+      otpReceived: true,
+      completedAtEpochMs: null,
+      expiresAtEpochMs: NOW + 10 * MINUTE,
+      ...overrides,
+    });
+
+  beforeEach(() => {
+    gateway = new FakeTransitionGateway();
+    gateway.ctx = listeningCtx();
+    store = new FakeStore();
+    service = makeService(gateway, store);
+  });
+
+  it("releases the hold on buyer completion, leaving the order successful", async () => {
+    const result = await service.complete(completeInput());
+
+    expect(result.statusCode).toBe(200);
+    if (!("data" in result.body)) throw new Error("expected data");
+    expect(result.body.data.status).toBe("success");
+    expect(result.body.data.releaseDisposition).toBe("available");
+    expect(result.body.data.completedAt).toBe(new Date(NOW).toISOString());
+
+    // The number is released and the completion stamped; no terminal write at
+    // all, so no status edge and nothing that could touch money.
+    expect(gateway.completions).toHaveLength(1);
+    expect(gateway.applied).toHaveLength(0);
+    const completion = gateway.completions[0];
+    expect(completion?.completedAtEpochMs).toBe(NOW);
+    expect(completion?.fromNumberStatus).toBe("busy");
+    expect(completion?.toNumberStatus).toBe("available");
+    expect(completion?.numberChanged).toBe(true);
+    expect(completion?.reason).toBe("buyer_complete");
+  });
+
+  it("parks the number offline when the device is no longer live", async () => {
+    gateway.ctx = listeningCtx({ deviceStatus: "offline", deviceLastSeenAtEpochMs: null });
+    const result = await service.complete(completeInput());
+    if (!("data" in result.body)) throw new Error("expected data");
+    expect(result.body.data.releaseDisposition).toBe("offline");
+    expect(gateway.completions[0]?.toNumberStatus).toBe("offline");
+  });
+
+  it("is idempotent once the hold was already released, reporting the original instant", async () => {
+    const releasedAt = NOW - MINUTE;
+    gateway.ctx = listeningCtx({ completedAtEpochMs: releasedAt, numberStatus: "available" });
+
+    const result = await service.complete(completeInput());
+
+    expect(result.statusCode).toBe(200);
+    if (!("data" in result.body)) throw new Error("expected data");
+    // A late buyer request and the sweep must agree on one answer, so the stored
+    // completion instant is reported rather than "now".
+    expect(result.body.data.completedAt).toBe(new Date(releasedAt).toISOString());
+    expect(result.body.data.releaseDisposition).toBeNull();
+    expect(gateway.completions).toHaveLength(0);
+  });
+
+  it("refuses to complete an order that never succeeded", async () => {
+    for (const orderStatus of ["waiting_sms", "cancelled", "timeout", "failed"] as const) {
+      gateway = new FakeTransitionGateway();
+      gateway.ctx = listeningCtx({ orderStatus });
+      service = makeService(gateway, new FakeStore());
+
+      const result = await service.complete(completeInput());
+
+      expect(result.statusCode).toBe(409);
+      expect((result.body as { error: { code: string } }).error.code).toBe("STATE_CONFLICT");
+      expect(gateway.completions).toHaveLength(0);
+    }
+  });
+
+  it("lets the sweep close only a window that has actually expired", async () => {
+    // Still open: the sweep must not steal the buyer's remaining time.
+    const early = await service.complete(
+      completeInput({ trigger: "expiry_sweep", observedAtEpochMs: NOW, idempotencyKey: "sweep-1" }),
+    );
+    expect(early.statusCode).toBe(409);
+    expect(gateway.completions).toHaveLength(0);
+
+    // Past the deadline the sweep may close it.
+    const late = await service.complete(
+      completeInput({
+        trigger: "expiry_sweep",
+        observedAtEpochMs: NOW + 11 * MINUTE,
+        idempotencyKey: "sweep-2",
+      }),
+    );
+    expect(late.statusCode).toBe(200);
+    if (!("data" in late.body)) throw new Error("expected data");
+    expect(late.body.data.completedAt).toBe(new Date(NOW + 11 * MINUTE).toISOString());
+    expect(gateway.completions).toHaveLength(1);
+    expect(gateway.completions[0]?.reason).toBe("expiry_sweep");
+  });
+
+  it("completes without touching a number that already moved to another order", async () => {
+    gateway.ctx = listeningCtx({ numberCurrentOrderId: "22222222-2222-4222-8222-222222222222" });
+
+    const result = await service.complete(completeInput());
+
+    expect(result.statusCode).toBe(200);
+    if (!("data" in result.body)) throw new Error("expected data");
+    expect(result.body.data.releaseDisposition).toBeNull();
+    // The completion is still stamped, but a live holder is never stripped.
+    expect(gateway.completions).toHaveLength(1);
+    expect(gateway.completions[0]?.numberChanged).toBe(false);
+  });
+
+  it("returns not found for a missing order", async () => {
+    gateway.ctx = null;
+    const result = await service.complete(completeInput());
+    expect(result.statusCode).toBe(404);
+    expect(gateway.completions).toHaveLength(0);
+  });
+
+  it("requires an idempotency key", async () => {
+    const result = await service.complete(completeInput({ idempotencyKey: null }));
+    expect(result.statusCode).toBe(400);
+    expect((result.body as { error: { code: string } }).error.code).toBe("IDEMPOTENCY_REQUIRED");
+    expect(gateway.completions).toHaveLength(0);
+  });
+
+  it("replays the first result for a retry with the same key and payload", async () => {
+    const first = await service.complete(completeInput());
+    const second = await service.complete(completeInput());
+    expect(second).toEqual(first);
+    // Replayed, not re-applied: a number release can never happen twice.
+    expect(gateway.completions).toHaveLength(1);
+  });
+
+  it("rejects a reused key with a different payload as a conflict", async () => {
+    await service.complete(completeInput());
+    const conflict = await service.complete(
+      completeInput({ trigger: "expiry_sweep", observedAtEpochMs: NOW + 11 * MINUTE }),
+    );
+    expect(conflict.statusCode).toBe(409);
+    expect((conflict.body as { error: { code: string } }).error.code).toBe("IDEMPOTENCY_CONFLICT");
+  });
+
+  it("reports a retryable state conflict on write contention", async () => {
+    gateway.contention = true;
+    const result = await service.complete(completeInput());
+    expect(result.statusCode).toBe(409);
+    const body = result.body as { error: { code: string; retryable: boolean } };
+    expect(body.error.retryable).toBe(true);
+  });
+
+  it("surfaces a missing active config as a retryable dependency error", async () => {
+    gateway.config = null;
+    const result = await service.complete(completeInput());
+    expect(result.statusCode).toBe(503);
+    const body = result.body as { error: { retryable: boolean } };
+    expect(body.error.retryable).toBe(true);
   });
 });

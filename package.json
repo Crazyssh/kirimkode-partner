@@ -6,6 +6,7 @@
   "description": "Standalone KirimKode Partner Platform",
   "scripts": {
     "dev": "next dev --port 3001",
+    "simulate": "node scripts/simulate-flow.mjs",
     "prisma:validate": "node scripts/run-prisma-schema-command.mjs validate",
     "prisma:generate": "node scripts/run-prisma-schema-command.mjs generate",
     "prisma:seed": "node prisma/seed.mjs",

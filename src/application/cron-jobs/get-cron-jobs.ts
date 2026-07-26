@@ -1,14 +1,18 @@
 /**
  * Composition root for the recovery + maintenance cron jobs (tasks 16.2–16.3).
  *
- * Builds the `offline-sweep`, `reservation-recovery`, and `order-timeout`
- * recovery {@link BatchJob}s (task 16.2) plus the `earning-release` and
- * `retention-redaction` maintenance jobs (task 16.3), wiring each to its Prisma
- * adapters and the system clock. Two jobs reuse a shared application command
- * rather than writing state themselves:
+ * Builds the `offline-sweep`, `reservation-recovery`, `order-timeout`, and
+ * `order-completion-sweep` recovery {@link BatchJob}s (task 16.2) plus the
+ * `earning-release` and `retention-redaction` maintenance jobs (task 16.3),
+ * wiring each to its Prisma adapters and the system clock. Three jobs reuse a
+ * shared application command rather than writing state themselves:
  *
  *  - `order-timeout` drives the shared task 9.4
  *    {@link import("@application/orders").OrderTransitionService} timeout command.
+ *  - `order-completion-sweep` drives that same service's `complete` command to
+ *    close listening windows that outlived their expiry, releasing the number hold
+ *    a `success` order keeps while it waits for a repeat OTP. Without it an
+ *    abandoned order would hold its number forever.
  *  - `earning-release` drives the shared task 14.2
  *    {@link EarningLifecycleService.releaseHold} command, which owns the
  *    hold-release rule, the projection compare-and-set, and the zero-sum
@@ -38,6 +42,7 @@ import {
   PrismaIdempotencyTransactionRunner,
   PrismaLedgerRepository,
   PrismaOfflineSweepGateway,
+  PrismaOrderCompletionSweepGateway,
   PrismaOrderTimeoutGateway,
   PrismaReconciliationGateway,
   PrismaReconciliationIssueRepository,
@@ -50,6 +55,7 @@ import { CryptoIdGenerator, SystemClock } from "@infrastructure/auth/system-cloc
 
 import { EarningReleaseJob } from "./earning-release-job";
 import { OfflineSweepJob } from "./offline-sweep-job";
+import { OrderCompletionSweepJob } from "./order-completion-sweep-job";
 import { OrderTimeoutJob } from "./order-timeout-job";
 import { ReconcileJob } from "./reconcile-job";
 import { ReservationRecoveryJob } from "./reservation-recovery-job";
@@ -97,6 +103,11 @@ export function createCronJobs(client: PartnerDatabaseClient): readonly BatchJob
     }),
     new OrderTimeoutJob({
       gateway: new PrismaOrderTimeoutGateway(client),
+      command: getOrderServices().transition,
+      clock,
+    }),
+    new OrderCompletionSweepJob({
+      gateway: new PrismaOrderCompletionSweepGateway(client),
       command: getOrderServices().transition,
       clock,
     }),

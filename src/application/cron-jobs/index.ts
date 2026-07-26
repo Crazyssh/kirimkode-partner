@@ -21,6 +21,13 @@ export {
   type OrderTimeoutJobDeps,
 } from "./order-timeout-job";
 export {
+  OrderCompletionSweepJob,
+  ORDER_COMPLETION_SWEEP_JOB,
+  type OrderCompletionSweepCommand,
+  type OrderCompletionSweepGateway,
+  type OrderCompletionSweepJobDeps,
+} from "./order-completion-sweep-job";
+export {
   EarningReleaseJob,
   EARNING_RELEASE_JOB,
   type EarningReleaseCommand,

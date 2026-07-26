@@ -165,12 +165,47 @@ describe("order and number state machine", () => {
     });
   });
 
-  it("moves valid OTP success to a terminal state and releases the number", () => {
-    expect(decide("waiting_sms", "busy", { type: "succeed", release: release() })).toMatchObject({
+  it("moves valid OTP success to a terminal state while keeping the number held", () => {
+    expect(decide("waiting_sms", "busy", { type: "succeed" })).toMatchObject({
       kind: "apply",
+      expectedOrderStatus: "waiting_sms",
+      expectedNumberStatus: "busy",
       nextOrderStatus: "success",
-      nextNumberStatus: "available",
+      nextNumberStatus: "busy",
+      numberChanged: false,
+      releaseDisposition: null,
     });
+  });
+
+  // Success keeps the number held so the order can still receive a repeat OTP:
+  // the money settles exactly once here, but the hold outlives the terminal
+  // status and is released exactly once later by `decideListeningHoldRelease`
+  // (buyer completes the order, or the expiry sweep closes the window). If
+  // success released the number, a resent SMS for this buyer could land inside
+  // a new buyer's window on the same number.
+  it("success keeps the number held so the order can still receive a repeat OTP", () => {
+    const decision = decide("waiting_sms", "busy", { type: "succeed" });
+
+    expect(decision.nextOrderStatus).toBe("success");
+    // The number is untouched: same status, no release decision taken, and
+    // nothing for the caller to write to the number row.
+    expect(decision.nextNumberStatus).toBe("busy");
+    expect(decision.releaseDisposition).toBeNull();
+    expect(decision.kind === "apply" && decision.numberChanged).toBe(false);
+  });
+
+  it("still refuses success when the number is not busy", () => {
+    // The CAS predicate is unchanged by the listening window: a success may only
+    // settle an order that genuinely still holds its number as `busy`.
+    for (const numberStatus of ["available", "reserved", "offline", "disabled"] as const) {
+      expect(decide("waiting_sms", numberStatus, { type: "succeed" })).toMatchObject({
+        kind: "reject",
+        code: "STATE_CONFLICT",
+        reason: "number_state_mismatch",
+        nextOrderStatus: "waiting_sms",
+        nextNumberStatus: numberStatus,
+      });
+    }
   });
 
 
@@ -203,7 +238,7 @@ describe("order and number state machine", () => {
   });
 
   it("rejects edges not present in the order state machine", () => {
-    expect(decide("created", "available", { type: "succeed", release: release() })).toMatchObject({
+    expect(decide("created", "available", { type: "succeed" })).toMatchObject({
       kind: "reject",
       reason: "illegal_transition",
     });

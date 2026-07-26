@@ -53,8 +53,17 @@ function safeView(over: Partial<SafePartnerSmsView> = {}): SafePartnerSmsView {
   });
 }
 
-function matchedResult(): SmsIngestionResult {
-  return Object.freeze({ status: "matched", sms: safeView(), orderId: ORDER_ID });
+/**
+ * The match mode carried by a `matched` ingestion result, read off the result
+ * union itself so this fixture cannot drift from it. "first" is the first OTP of
+ * an order; "repeat" is one that arrived later in the order's listening window.
+ * Either way it stays internal to the application layer — the agent envelope
+ * never echoes it, just as it never echoes raw SMS or OTP text.
+ */
+type MatchedMode = Extract<SmsIngestionResult, { status: "matched" }>["mode"];
+
+function matchedResult(mode: MatchedMode = "first"): SmsIngestionResult {
+  return Object.freeze({ status: "matched", sms: safeView(), orderId: ORDER_ID, mode });
 }
 
 /** A minimal Request stand-in: the handler calls `.text()` and `.headers.get()`. */

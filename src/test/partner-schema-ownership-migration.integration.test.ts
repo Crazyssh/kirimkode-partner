@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -252,13 +252,24 @@ describe.runIf(hasPostgres)("Partner schema ownership and migration", () => {
       const after = await schemaObjectCounts(client);
       expect(after).toEqual(before);
 
+      // Re-deploying records no duplicate rows: the ledger of applied
+      // migrations is exactly the set on disk, baseline first. Later additive
+      // migrations are the correct way to evolve an already-applied schema, so
+      // this asserts the ORDER and the set — never a fixed count of one.
       const applied = await client.query<{ migration_name: string }>(`
         SELECT migration_name
         FROM _prisma_migrations
         WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL
         ORDER BY migration_name
       `);
-      expect(applied.rows).toEqual([{ migration_name: migrationName }]);
+      const onDisk = (await readdir(path.join(repositoryRoot, "prisma/migrations"), {
+        withFileTypes: true,
+      }))
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort();
+      expect(applied.rows.map((row) => row.migration_name)).toEqual(onDisk);
+      expect(onDisk[0]).toBe(migrationName);
     } finally {
       await client.end();
     }
