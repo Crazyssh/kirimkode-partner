@@ -10,6 +10,12 @@
  *    terminal state (`terminalAt`).
  *  - `heartbeat_metadata` — prune `DeviceHeartbeat` samples after 30 days.
  *  - `security_log` — prune `SecurityEvent` rows after 90 days.
+ *  - `rate_limit_counter` — prune `rate_limit_counters` rows whose own
+ *    `expiresAt` has passed. This one is not window-configured: the row already
+ *    carries the instant it stops counting, so the boundary is `expiresAt <= now`
+ *    (see {@link import("./ports").RETENTION_EXPIRY_PASSES}). Without it the
+ *    shared rate-limit table would accumulate one dead row per limiter key
+ *    forever (requirement 2.7).
  *
  * The protected financial/audit evidence (`audit`, `ledger`, `payout`, retained
  * 7 years) is NEVER touched by this job: those categories are absent from the
@@ -45,9 +51,9 @@ import type {
   RetentionBatchInput,
   RetentionBatchResult,
   RetentionGateway,
-  RetentionPassCategory,
+  RetentionPass,
 } from "./ports";
-import { RETENTION_PASS_CATEGORIES } from "./ports";
+import { isRetentionExpiryPass, RETENTION_PASSES } from "./ports";
 
 /** The registry name for this job. */
 export const RETENTION_REDACTION_JOB = "retention-redaction";
@@ -61,7 +67,7 @@ const DEFAULT_BATCH_SIZE = 200;
  * the first category".
  */
 interface RetentionCursor {
-  readonly category: RetentionPassCategory;
+  readonly category: RetentionPass;
   readonly afterId: string | null;
 }
 
@@ -95,15 +101,22 @@ export class RetentionRedactionJob implements BatchJob {
       (await this.deps.gateway.loadRetentionConfig()) ?? DEFAULT_RETENTION_CONFIG;
 
     const { index, afterId } = decodeCursor(context.cursor);
-    const category = RETENTION_PASS_CATEGORIES[index];
+    const category = RETENTION_PASSES[index];
 
-    // Defence-in-depth: never let a protected financial/audit category be
-    // disposed of, even if the pass list were mis-edited (requirement 19.5).
-    if (isProtectedEvidence(category)) {
-      return advance(index, 0);
+    // A self-expiring pass carries its boundary in the row itself, so `now` IS
+    // the boundary — there is no configured window to subtract, and such a table
+    // can never be protected financial/audit evidence.
+    if (!isRetentionExpiryPass(category)) {
+      // Defence-in-depth: never let a protected financial/audit category be
+      // disposed of, even if the pass list were mis-edited (requirement 19.5).
+      if (isProtectedEvidence(category)) {
+        return advance(index, 0);
+      }
     }
 
-    const olderThanEpochMs = now - retentionWindowMs(category, retention);
+    const olderThanEpochMs = isRetentionExpiryPass(category)
+      ? now
+      : now - retentionWindowMs(category, retention);
     const input: RetentionBatchInput = {
       olderThanEpochMs,
       nowEpochMs: now,
@@ -124,7 +137,7 @@ export class RetentionRedactionJob implements BatchJob {
   }
 
   private runPass(
-    category: RetentionPassCategory,
+    category: RetentionPass,
     input: RetentionBatchInput,
   ): Promise<RetentionBatchResult> {
     switch (category) {
@@ -136,6 +149,8 @@ export class RetentionRedactionJob implements BatchJob {
         return this.deps.gateway.pruneHeartbeatMetadata(input);
       case "security_log":
         return this.deps.gateway.pruneSecurityEvents(input);
+      case "rate_limit_counter":
+        return this.deps.gateway.pruneExpiredRateLimitCounters(input);
     }
   }
 }
@@ -147,9 +162,7 @@ function decodeCursor(cursor: JobCursor): {
 } {
   if (cursor !== null && typeof cursor === "object" && !Array.isArray(cursor)) {
     const raw = cursor as { category?: unknown; afterId?: unknown };
-    const index = RETENTION_PASS_CATEGORIES.indexOf(
-      raw.category as RetentionPassCategory,
-    );
+    const index = RETENTION_PASSES.indexOf(raw.category as RetentionPass);
     if (index >= 0) {
       const afterId = typeof raw.afterId === "string" ? raw.afterId : null;
       return { index, afterId };
@@ -165,11 +178,11 @@ function decodeCursor(cursor: JobCursor): {
  */
 function advance(index: number, processed: number): BatchStepResult {
   const next = index + 1;
-  if (next < RETENTION_PASS_CATEGORIES.length) {
+  if (next < RETENTION_PASSES.length) {
     return {
       processed,
       nextCursor: {
-        category: RETENTION_PASS_CATEGORIES[next],
+        category: RETENTION_PASSES[next],
         afterId: null,
       } satisfies RetentionCursor,
       done: false,

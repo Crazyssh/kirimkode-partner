@@ -4,9 +4,9 @@
  * Wires the {@link AgentApiAuthenticator} to its production adapters: the
  * Prisma-backed device-credential lookup and shared `ReplayNonce` gateway (task
  * 7.1 client), the task 8.1 `CryptoDeviceCredentialFactory` (reused for
- * constant-time secret verification), a process-local rate-limit store, the env
- * device-credential pepper (task 2.1), and the system clock. Transport — the
- * `/api/agent/v1/*` routes — imports only the authenticator from here, never
+ * constant-time secret verification), the shared Prisma-backed rate-limit store,
+ * the env device-credential pepper (task 2.1), and the system clock. Transport —
+ * the `/api/agent/v1/*` routes — imports only the authenticator from here, never
  * the adapters or the raw Prisma client.
  */
 import { bootstrapPartnerApplication } from "@application/bootstrap/bootstrap-partner-application";
@@ -16,11 +16,11 @@ import {
   PrismaAgentNumberGateway,
   PrismaIdempotencyStore,
   PrismaIdempotencyTransactionRunner,
+  PrismaRateLimitStore,
   PrismaReplayNonceGateway,
   type PartnerTransactionClient,
 } from "@infrastructure/database";
 import { CryptoDeviceCredentialFactory } from "@infrastructure/auth/crypto-device-credential";
-import { InMemoryRateLimitStore } from "@infrastructure/auth/in-memory-rate-limit-store";
 import { CryptoIdGenerator, SystemClock } from "@infrastructure/auth/system-clock";
 import { IdempotencyEngine } from "@application/internal-api";
 import { AgentNumberService } from "@application/numbers";
@@ -44,7 +44,9 @@ export function getAgentApiServices(): AgentApiServices {
         credentials: new PrismaAgentDeviceCredentialGateway(client),
         secretVerifier: new CryptoDeviceCredentialFactory(config.deviceCredentialPepper),
         nonces: new PrismaReplayNonceGateway(client),
-        rateLimitStore: new InMemoryRateLimitStore(),
+        // Shared, durable counters: device-facing limits must hold across every
+        // Node process and across restarts (requirement 2.7).
+        rateLimitStore: new PrismaRateLimitStore(client),
         clock: new SystemClock(),
         // Production rejects plain HTTP; dev/test allow it for local flows.
         enforceHttps: config.environment === "production",

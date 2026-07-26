@@ -2,9 +2,9 @@
  * Composition root for the human-auth services.
  *
  * Wires the pure services to their production adapters (Argon2id, crypto
- * tokens, Prisma gateways, in-memory rate limiter) from validated runtime
- * config. The transport layer imports only the services from here and never the
- * adapters or the Prisma client directly.
+ * tokens, Prisma gateways, the shared Prisma-backed rate-limit store) from
+ * validated runtime config. The transport layer imports only the services from
+ * here and never the adapters or the Prisma client directly.
  */
 import { bootstrapPartnerApplication } from "@application/bootstrap/bootstrap-partner-application";
 import { getPartnerDatabaseClient } from "@infrastructure/database";
@@ -15,7 +15,7 @@ import { Argon2idPasswordHasher } from "@infrastructure/auth/argon2-password-has
 import { CryptoSessionTokenIssuer } from "@infrastructure/auth/crypto-session-token";
 import { CryptoOneTimeTokenIssuer } from "@infrastructure/auth/crypto-one-time-token";
 import { SmtpEmailSender } from "@infrastructure/auth/smtp-email-sender";
-import { InMemoryRateLimitStore } from "@infrastructure/auth/in-memory-rate-limit-store";
+import { PrismaRateLimitStore } from "@infrastructure/database/prisma-rate-limit-store";
 import { CryptoIdGenerator, SystemClock } from "@infrastructure/auth/system-clock";
 
 import { sessionTtlFromSeconds } from "./auth-config";
@@ -56,8 +56,11 @@ export function getAuthServices(): AuthServices {
     const idGenerator = new CryptoIdGenerator();
     const passwordHasher = new Argon2idPasswordHasher();
     const tokenIssuer = new CryptoSessionTokenIssuer();
+    // Shared, durable rate-limit counters: a process-local store gave every Node
+    // process (and every restart) its own window, so the limits below were
+    // effectively unenforced (requirement 2.7).
     const rateLimiter = new AuthRateLimiter(
-      new InMemoryRateLimitStore(() => clock.nowEpochMs()),
+      new PrismaRateLimitStore(client, () => clock.nowEpochMs()),
       clock,
     );
     const identity = new PrismaAuthIdentityGateway(client);

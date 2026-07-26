@@ -559,6 +559,37 @@ model ReplayNonce {
   @@map("replay_nonces")
 }
 
+/// Shared fixed-window rate-limit counters (requirement 2.7).
+///
+/// The limiter key IS the primary key: a rate-limit window is identified by its
+/// key alone, so an upsert on that key is the concurrency primitive that lets
+/// every Node process count into ONE window. A surrogate id would permit two
+/// rows for the same key and re-introduce the per-process counters this table
+/// exists to remove.
+///
+/// `windowStart` / `blockedUntil` / `expiresAt` are stored as `timestamptz`
+/// (never epoch integers) so the durable window is inspectable in SQL and the
+/// retention sweep can scan `expiresAt` the same way it does for replay_nonces.
+/// The pure task 7.2 window policy remains the only source of truth for the
+/// arithmetic; this table just persists its counter.
+model RateLimitCounter {
+  /// The limiter key, e.g. `login:<email>|<ip>` or `agent:device:<id>:<ep>:…`.
+  /// Sized for the longest composed key (254-char email + IPv6 + prefix).
+  key          String    @id @db.VarChar(512)
+  count        Int
+  windowStart  DateTime  @db.Timestamptz(6)
+  /// Set once the window's limit trips and the rule carries a cooldown; NULL
+  /// while the key is merely counting.
+  blockedUntil DateTime? @db.Timestamptz(6)
+  /// When this counter stops counting. A row at or past `expiresAt` is treated
+  /// as absent by reads and is swept by the `retention-redaction` job.
+  expiresAt    DateTime  @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@index([expiresAt])
+  @@map("rate_limit_counters")
+}
+
 // DB-only invariants reserved for the Task 3.4 baseline migration:
 // - CHECK non-negative monetary values and internally consistent snapshot amounts.
 // - CHECK activeCanonicalNumber mirrors canonicalNumber iff the number is non-disabled/enabled.

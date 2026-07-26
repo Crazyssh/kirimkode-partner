@@ -271,6 +271,44 @@ export const RETENTION_PASS_CATEGORIES = [
 
 export type RetentionPassCategory = (typeof RETENTION_PASS_CATEGORIES)[number];
 
+/**
+ * Passes that sweep rows carrying their OWN expiry instant, rather than rows
+ * dated by a platform-configured retention window.
+ *
+ * These are kept separate from {@link RETENTION_PASS_CATEGORIES} because they
+ * are a different kind of question. A retention category asks "has this
+ * record's configured window elapsed?" and is answered by the pure task 5.7
+ * domain (`retentionWindowMs`, `isProtectedEvidence`). A short-lived keyed row
+ * like `rate_limit_counters` already stores the instant it stops being
+ * meaningful, so its boundary is simply `expiresAt <= now` — there is no
+ * configurable window to look up, and no possibility of it being protected
+ * financial/audit evidence.
+ *
+ *  - `rate_limit_counter` — delete `rate_limit_counters` rows whose window has
+ *    closed. The shared store treats an expired row as absent, so these rows are
+ *    already dead weight; without a sweep the table would grow by one row per
+ *    distinct limiter key forever (requirement 2.7).
+ */
+export const RETENTION_EXPIRY_PASSES = ["rate_limit_counter"] as const;
+
+export type RetentionExpiryPass = (typeof RETENTION_EXPIRY_PASSES)[number];
+
+/**
+ * The full ordered pass list the job walks: the configured-window categories
+ * first, then the self-expiring sweeps.
+ */
+export const RETENTION_PASSES = [
+  ...RETENTION_PASS_CATEGORIES,
+  ...RETENTION_EXPIRY_PASSES,
+] as const;
+
+export type RetentionPass = (typeof RETENTION_PASSES)[number];
+
+/** True when a pass sweeps rows by their own `expiresAt` column. */
+export function isRetentionExpiryPass(pass: RetentionPass): pass is RetentionExpiryPass {
+  return (RETENTION_EXPIRY_PASSES as readonly string[]).includes(pass);
+}
+
 export type { RetentionConfig };
 
 /** Inputs to one bounded retention batch for a single category. */
@@ -313,6 +351,9 @@ export interface RetentionBatchResult {
  *    authoritative `lastSeenAt` liveness on the device is a separate column and
  *    is preserved.
  *  - `pruneSecurityEvents` — delete stale `SecurityEvent` rows.
+ *  - `pruneExpiredRateLimitCounters` — delete `rate_limit_counters` rows whose
+ *    own `expiresAt` has passed (see {@link RETENTION_EXPIRY_PASSES}); this pass
+ *    reads `olderThanEpochMs` as "now", not as `now - configured window`.
  *
  * The financial/audit evidence tables are never touched here (requirement
  * 19.5). Infrastructure supplies the Prisma adapter; raw Prisma never leaves it.
@@ -329,6 +370,15 @@ export interface RetentionGateway {
     input: RetentionBatchInput,
   ): Promise<RetentionBatchResult>;
   pruneSecurityEvents(input: RetentionBatchInput): Promise<RetentionBatchResult>;
+  /**
+   * Delete rate-limit counters whose window has closed
+   * (`expiresAt <= olderThanEpochMs`). A live counter is never touched, so the
+   * sweep can neither reset a window that is still counting nor lift an active
+   * cooldown. Pages by `key` (the table's primary key) rather than an `id`.
+   */
+  pruneExpiredRateLimitCounters(
+    input: RetentionBatchInput,
+  ): Promise<RetentionBatchResult>;
 }
 
 // --- reconcile --------------------------------------------------------------

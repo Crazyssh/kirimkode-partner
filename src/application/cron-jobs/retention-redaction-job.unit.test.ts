@@ -6,7 +6,11 @@ import {
   RETENTION_REDACTION_JOB,
   RetentionRedactionJob,
 } from "./retention-redaction-job";
-import { RETENTION_PASS_CATEGORIES } from "./ports";
+import {
+  RETENTION_EXPIRY_PASSES,
+  RETENTION_PASS_CATEGORIES,
+  RETENTION_PASSES,
+} from "./ports";
 import type {
   Clock,
   RetentionBatchInput,
@@ -73,6 +77,11 @@ class FakeRetentionGateway implements RetentionGateway {
   ): Promise<RetentionBatchResult> {
     return this.run("security_log", input);
   }
+  pruneExpiredRateLimitCounters(
+    input: RetentionBatchInput,
+  ): Promise<RetentionBatchResult> {
+    return this.run("rate_limit_counter", input);
+  }
 }
 
 function makeJob(gateway: RetentionGateway, batchSize = 200): RetentionRedactionJob {
@@ -100,7 +109,21 @@ describe("RetentionRedactionJob", () => {
     ]);
     for (const protectedCategory of ["audit", "ledger", "payout"]) {
       expect([...RETENTION_PASS_CATEGORIES]).not.toContain(protectedCategory);
+      expect([...RETENTION_PASSES]).not.toContain(protectedCategory);
     }
+  });
+
+  // **Validates: Requirements 2.7, 19.4**
+  it("walks the configured-window categories first, then the self-expiring sweeps", () => {
+    // The self-expiring passes are a separate list because their boundary is the
+    // row's own `expiresAt`, not a platform-configured window; keeping them out
+    // of RETENTION_PASS_CATEGORIES is what lets that list stay typed against the
+    // pure task 5.7 domain categories.
+    expect([...RETENTION_EXPIRY_PASSES]).toEqual(["rate_limit_counter"]);
+    expect([...RETENTION_PASSES]).toEqual([
+      ...RETENTION_PASS_CATEGORIES,
+      ...RETENTION_EXPIRY_PASSES,
+    ]);
   });
 
   it("processes the first category from a null cursor and advances to the next", async () => {
@@ -148,7 +171,19 @@ describe("RetentionRedactionJob", () => {
     expect(gateway.calls[0]?.input.afterId).toBe("hb-9");
   });
 
-  it("reports done and resets the cursor once the last category drains", async () => {
+  it("reports done and resets the cursor once the last pass drains", async () => {
+    const gateway = new FakeRetentionGateway();
+    const result = await makeJob(gateway).runBatch({
+      cursor: { category: "rate_limit_counter", afterId: null },
+      nowEpochMs: NOW,
+    });
+
+    expect(gateway.calls[0]?.category).toBe("rate_limit_counter");
+    expect(result.done).toBe(true);
+    expect(result.nextCursor).toBeNull();
+  });
+
+  it("advances from the last configured-window category into the expiry sweep", async () => {
     const gateway = new FakeRetentionGateway();
     const result = await makeJob(gateway).runBatch({
       cursor: { category: "security_log", afterId: null },
@@ -156,8 +191,49 @@ describe("RetentionRedactionJob", () => {
     });
 
     expect(gateway.calls[0]?.category).toBe("security_log");
-    expect(result.done).toBe(true);
-    expect(result.nextCursor).toBeNull();
+    expect(result.done).toBe(false);
+    expect(result.nextCursor).toEqual({
+      category: "rate_limit_counter",
+      afterId: null,
+    });
+  });
+
+  // **Validates: Requirements 2.7**
+  it("passes `now` as the boundary for a self-expiring pass, not `now - window`", async () => {
+    // A rate-limit counter stores the instant it stops counting, so the sweep
+    // deletes rows whose own `expiresAt` has passed. Subtracting a configured
+    // window here would leave closed windows alive for an extra window's length.
+    const gateway = new FakeRetentionGateway();
+    await makeJob(gateway).runBatch({
+      cursor: { category: "rate_limit_counter", afterId: null },
+      nowEpochMs: NOW,
+    });
+
+    expect(gateway.calls[0]?.input.olderThanEpochMs).toBe(NOW);
+    expect(gateway.calls[0]?.input.nowEpochMs).toBe(NOW);
+  });
+
+  it("resumes a self-expiring pass from its persisted key cursor", async () => {
+    // `rate_limit_counters` is keyed by the limiter key, so the cursor carries a
+    // key rather than a uuid; the job must pass it through unchanged.
+    const gateway = new FakeRetentionGateway({
+      rate_limit_counter: () => ({
+        processed: 200,
+        lastId: "login:user@example.test|203.0.113.7",
+        drained: false,
+      }),
+    });
+    const result = await makeJob(gateway, 200).runBatch({
+      cursor: { category: "rate_limit_counter", afterId: "agent:ip:203.0.113.1" },
+      nowEpochMs: NOW,
+    });
+
+    expect(gateway.calls[0]?.input.afterId).toBe("agent:ip:203.0.113.1");
+    expect(result.nextCursor).toEqual({
+      category: "rate_limit_counter",
+      afterId: "login:user@example.test|203.0.113.7",
+    });
+    expect(result.done).toBe(false);
   });
 
   it("falls back to a fresh sweep when the cursor shape is unrecognised", async () => {

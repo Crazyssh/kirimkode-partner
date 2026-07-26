@@ -3,9 +3,9 @@
  *
  * Wires the pure admin-realm services to their production adapters (Argon2id,
  * crypto session tokens, Prisma admin identity/session gateways, the task 7.1
- * unit of work behind the partner lifecycle gateway, in-memory rate limiter)
- * from validated runtime config. Transport imports only the services from here
- * — never the adapters or the Prisma client directly.
+ * unit of work behind the partner lifecycle gateway, the shared Prisma-backed
+ * rate-limit store) from validated runtime config. Transport imports only the
+ * services from here — never the adapters or the Prisma client directly.
  */
 import { bootstrapPartnerApplication } from "@application/bootstrap/bootstrap-partner-application";
 import { AuthRateLimiter } from "@application/auth/auth-rate-limiter";
@@ -22,12 +22,12 @@ import {
   PrismaAuditEventRepository,
   PrismaOperationalQueryGateway,
   PrismaPartnerLifecycleGateway,
+  PrismaRateLimitStore,
   PrismaRawSmsReadGateway,
   PrismaUnitOfWork,
 } from "@infrastructure/database";
 import { Argon2idPasswordHasher } from "@infrastructure/auth/argon2-password-hasher";
 import { CryptoSessionTokenIssuer } from "@infrastructure/auth/crypto-session-token";
-import { InMemoryRateLimitStore } from "@infrastructure/auth/in-memory-rate-limit-store";
 import { CryptoIdGenerator, SystemClock } from "@infrastructure/auth/system-clock";
 import { createSmsOtpCipher } from "@infrastructure/crypto/sms-otp-cipher";
 
@@ -86,8 +86,11 @@ export function getAdminServices(): AdminServices {
     const idGenerator = new CryptoIdGenerator();
     const passwordHasher = new Argon2idPasswordHasher();
     const tokenIssuer = new CryptoSessionTokenIssuer();
+    // Shared, durable rate-limit counters. The admin realm is the highest-value
+    // brute-force target in the app, so a per-process window was the least
+    // acceptable here (requirement 2.7).
     const rateLimiter = new AuthRateLimiter(
-      new InMemoryRateLimitStore(() => clock.nowEpochMs()),
+      new PrismaRateLimitStore(client, () => clock.nowEpochMs()),
       clock,
     );
     const identity = new PrismaAdminIdentityGateway(client);

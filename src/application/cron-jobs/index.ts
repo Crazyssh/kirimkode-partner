@@ -43,7 +43,12 @@ export {
   RECONCILE_JOB,
   type ReconcileJobDeps,
 } from "./reconcile-job";
-export { RETENTION_PASS_CATEGORIES } from "./ports";
+export {
+  isRetentionExpiryPass,
+  RETENTION_EXPIRY_PASSES,
+  RETENTION_PASS_CATEGORIES,
+  RETENTION_PASSES,
+} from "./ports";
 export type {
   Clock,
   IdGenerator,
@@ -61,6 +66,8 @@ export type {
   ReleasableEarningRow,
   EarningReleaseGateway,
   RetentionPassCategory,
+  RetentionExpiryPass,
+  RetentionPass,
   RetentionConfig,
   RetentionBatchInput,
   RetentionBatchResult,

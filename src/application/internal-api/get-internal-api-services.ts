@@ -3,8 +3,8 @@
  *
  * Wires the {@link InternalApiAuthenticator} to its production adapters: the env
  * HMAC config (task 2.1), the node HMAC/SHA-256 verifier, the Prisma-backed
- * `ServiceCredential` and `ReplayNonce` gateways (task 7.1 client), a
- * process-local rate-limit store, and the system clock. Transport — the
+ * `ServiceCredential` and `ReplayNonce` gateways (task 7.1 client), the shared
+ * Prisma-backed rate-limit store, and the system clock. Transport — the
  * `/api/internal/v1/*` routes — imports only the authenticator from here, never
  * the adapters or the raw Prisma client.
  */
@@ -13,11 +13,11 @@ import {
   getPartnerDatabaseClient,
   PrismaIdempotencyStore,
   PrismaIdempotencyTransactionRunner,
+  PrismaRateLimitStore,
   PrismaReplayNonceGateway,
   PrismaServiceCredentialGateway,
   type PartnerTransactionClient,
 } from "@infrastructure/database";
-import { InMemoryRateLimitStore } from "@infrastructure/auth/in-memory-rate-limit-store";
 import { NodeHmacSignatureVerifier } from "@infrastructure/auth/node-hmac-signature-verifier";
 import { SystemClock } from "@infrastructure/auth/system-clock";
 
@@ -57,7 +57,9 @@ export function getInternalApiServices(): InternalApiServices {
         credentials: new PrismaServiceCredentialGateway(client),
         nonces: new PrismaReplayNonceGateway(client),
         verifier: new NodeHmacSignatureVerifier(),
-        rateLimitStore: new InMemoryRateLimitStore(),
+        // Shared, durable counters so the per-client request limit holds across
+        // every Node process and across restarts (requirement 2.7).
+        rateLimitStore: new PrismaRateLimitStore(client),
         clock: new SystemClock(),
         // Production rejects plain HTTP; dev/test allow it for local flows.
         enforceHttps: config.environment === "production",
