@@ -239,10 +239,15 @@ await main();
  * Scheduler setup — register exactly ONE minutely entry.
  * ---------------------------------------------------------------------------
  *
- * Linux (crontab -e). Logs go to the journal via `logger` so a failing tick is
- * discoverable; the `--` guards against a path with spaces:
+ * Paths below match deploy/README.md: the app lives in
+ * /var/www/kirimkode-partner and its secrets in /etc/kirimkode-partner/. Keep
+ * the two in step — a scheduler pointed at a directory that does not exist
+ * fails silently once a minute, which looks exactly like "no work to do".
  *
- *   * * * * * cd /srv/kirimkode-partner && /usr/bin/node scripts/run-cron.mjs 2>&1 | /usr/bin/logger -t partner-cron
+ * Linux (crontab -e). Logs go to the journal via `logger` so a failing tick is
+ * discoverable:
+ *
+ *   * * * * * cd /var/www/kirimkode-partner && /usr/bin/node scripts/run-cron.mjs 2>&1 | /usr/bin/logger -t partner-cron
  *
  * Linux (systemd timer) — preferred, because a failed unit is visible to
  * `systemctl --failed` and does not depend on shell PATH:
@@ -253,10 +258,11 @@ await main();
  *   After=network-online.target
  *   [Service]
  *   Type=oneshot
- *   WorkingDirectory=/srv/kirimkode-partner
+ *   WorkingDirectory=/var/www/kirimkode-partner
  *   ExecStart=/usr/bin/node scripts/run-cron.mjs
- *   # Prefer an environment file over the repo .env for the secret:
- *   EnvironmentFile=/etc/kirimkode/partner-cron.env
+ *   # Prefer an environment file over the repo .env for the secret. Reusing the
+ *   # app's own env file is fine: it already carries PARTNER_CRON_SECRET.
+ *   EnvironmentFile=/etc/kirimkode-partner/partner.env
  *
  *   # /etc/systemd/system/partner-cron.timer
  *   [Unit]

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { createPartnerBackupPlan } from "../../scripts/backup-partner-db.mjs";
 import { createPartnerReleasePlan, partnerReleaseStepEnvironment } from "../../scripts/release-partner.mjs";
 import { createPartnerRestorePlan } from "../../scripts/restore-partner-db.mjs";
+import { CRON_SCHEDULE } from "../../scripts/lib/cron-schedule.mjs";
 import {
   assertPartnerBackupArtifact,
   assertPartnerProcessName,
@@ -116,6 +117,56 @@ describe("Partner deployment artifacts", () => {
       ["pm2", "reload", "kirimkode-partner", "--update-env"],
     ]);
     expect(JSON.stringify(plan)).not.toMatch(/(?:reload|restart).*?["']?kirimkode["']?(?!-partner)/);
+  });
+
+  // Validates: Requirements 20.1, 20.2 — the jobs only ever run because an
+  // external scheduler dispatches them, so the deploy guide has to say so.
+  //
+  // This is a documentation guard with a live failure behind it: the guide once
+  // described the whole host setup without mentioning the scheduler at all, and a
+  // server built from it looked healthy while earnings never became available and
+  // partners could not cash out. `partner-cron-schedule.unit.test.ts` proves each
+  // job HAS a cadence; nothing proved an operator is ever told to start the tick.
+  it("tells the operator to register the cron scheduler, and how to verify it", () => {
+    const guide = deploymentFile("deploy/README.md");
+
+    // The dispatcher, and the fact that exactly one minutely entry drives it.
+    expect(guide).toContain("scripts/run-cron.mjs");
+    expect(guide).toMatch(/OnCalendar=minutely/);
+    expect(guide).toMatch(/systemctl enable --now partner-cron\.timer/);
+
+    // The consequence of skipping it, so the step does not read as optional.
+    expect(guide).toMatch(/cannot cash out|never become available/i);
+
+    // A post-release check the operator can alert on.
+    expect(guide).toContain("/api/health/cron");
+    expect(guide).toContain("--dry-run");
+  });
+
+  it("keeps the scheduler paths identical in the guide and in run-cron.mjs", () => {
+    // A unit file pointing at a directory that does not exist fails silently once
+    // a minute, which is indistinguishable from "nothing was due".
+    const guide = deploymentFile("deploy/README.md");
+    const runner = deploymentFile("scripts/run-cron.mjs");
+
+    for (const literal of ["/var/www/kirimkode-partner", "/etc/kirimkode-partner/partner.env"]) {
+      expect(guide).toContain(literal);
+      expect(runner).toContain(literal);
+    }
+    // The pre-existing footer pointed at /srv and /etc/kirimkode/, neither of which
+    // the guide ever creates. Neither may come back.
+    for (const stale of ["/srv/kirimkode-partner", "/etc/kirimkode/partner-cron.env"]) {
+      expect(`${guide}\n${runner}`).not.toContain(stale);
+    }
+  });
+
+  it("names every scheduled job in the deploy guide", () => {
+    // An eighth job added to the schedule without a line here would leave the
+    // guide's job list quietly wrong for whoever operates the host.
+    const guide = deploymentFile("deploy/README.md");
+    for (const { job } of CRON_SCHEDULE) {
+      expect(guide).toContain(job);
+    }
   });
 
   it("creates a Partner-only custom-format backup plan", () => {
