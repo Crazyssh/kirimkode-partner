@@ -9,6 +9,8 @@ import {
   ActiveOfferConflictError,
   OfferInUseError,
   type AuditWriteInput,
+  type CatalogDimension,
+  type InventoryFilter,
   type NewOfferRecord,
   type OfferManagementGateway,
   type OfferManagementTransaction,
@@ -36,6 +38,21 @@ const CONFIG: PlatformConfigSnapshot = Object.freeze({
   markupBps: 1_500,
   roundToIdr: 50,
   heartbeatTimeoutSeconds: 90,
+});
+
+/** The served catalog: the MVP dimension, enabled with no pricing overrides. */
+const MVP_DIMENSION: CatalogDimension = Object.freeze({
+  serviceCode: "wa",
+  countryCode: "ID",
+  operatorCode: "any",
+  enabled: true,
+});
+
+/** A SECOND dimension, impossible to offer before catalog membership. */
+const TELEGRAM_DIMENSION: InventoryFilter = Object.freeze({
+  serviceCode: "tg",
+  countryCode: "ID",
+  operatorCode: "any",
 });
 
 function dimensionKey(partnerId: string, status: OfferStatus): string | null {
@@ -74,6 +91,8 @@ class FakeOfferGateway implements OfferManagementGateway {
   readonly audits: AuditWriteInput[] = [];
   partnerStatus: PartnerStatus = "approved";
   config: PlatformConfigSnapshot | null = CONFIG;
+  /** The served catalog. Defaults to the single MVP dimension. */
+  dimensions: CatalogDimension[] = [MVP_DIMENSION];
   /** When true, deleting any offer raises OfferInUseError. */
   deleteBlocked = false;
 
@@ -90,6 +109,7 @@ class FakeOfferGateway implements OfferManagementGateway {
     const audits = this.audits;
     const readPartnerStatus = (): PartnerStatus => this.partnerStatus;
     const readConfig = (): PlatformConfigSnapshot | null => this.config;
+    const readDimensions = (): readonly CatalogDimension[] => this.dimensions;
     const isDeleteBlocked = (): boolean => this.deleteBlocked;
 
     const assertUniqueActiveDimension = (key: string | null, selfId: string): void => {
@@ -107,6 +127,24 @@ class FakeOfferGateway implements OfferManagementGateway {
       },
       async loadActiveConfig() {
         return readConfig();
+      },
+      async loadCatalog() {
+        return {
+          dimensions: readDimensions().filter((dimension) => dimension.enabled),
+          declared: readDimensions().length > 0,
+        };
+      },
+      async loadDimension(filter: InventoryFilter) {
+        return {
+          declared: readDimensions().length > 0,
+          dimension:
+            readDimensions().find(
+              (dimension) =>
+                dimension.serviceCode === filter.serviceCode &&
+                dimension.countryCode === filter.countryCode &&
+                dimension.operatorCode === filter.operatorCode,
+            ) ?? null,
+        };
       },
       async findOfferById(id) {
         const found = offers.get(id);
@@ -447,6 +485,173 @@ describe("OfferManagementService", () => {
         requestId: REQUEST_ID,
       });
       expect(removed).toEqual({ ok: false, reason: "offer_in_use" });
+    });
+  });
+
+  // A partner may offer any SERVED dimension, and every mutation on an existing
+  // offer is validated against that OFFER's own dimension — not the config's —
+  // so an offer on a second dimension stays repriceable and activatable. Before
+  // catalog membership, none of this was possible: only the config's dimension
+  // was acceptable, so a Telegram offer could not be created at all.
+  describe("second catalog dimension", () => {
+    /** Serve the MVP dimension plus Telegram, the latter priced dearer. */
+    function serveTelegram(overrides: Partial<CatalogDimension> = {}): void {
+      gateway.dimensions = [
+        MVP_DIMENSION,
+        {
+          ...TELEGRAM_DIMENSION,
+          enabled: true,
+          fixedFeeIdr: 500,
+          markupBps: 3_000,
+          roundToIdr: 100,
+          ...overrides,
+        },
+      ];
+    }
+
+    it("creates an offer on a second served dimension priced by ITS override", async () => {
+      serveTelegram();
+
+      const result = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.offer.serviceCode).toBe("tg");
+      // 1000 + 500 fee + ceil(1000*3000/10000)=300 -> 1800.
+      expect(result.offer.pricing.retailPriceIdr).toBe(1_800);
+      expect(result.offer.pricing.payoutIdr).toBe(1_000);
+      // Currency and the snapshot version stay global.
+      expect(result.offer.currency).toBe("IDR");
+      expect(result.offer.configVersion).toBe(1);
+      // The active-dimension slot is keyed on the OFFER's own triple.
+      const stored = [...gateway.offers.values()][0];
+      expect(stored?.activeDimensionKey).toBe(`${PARTNER_A}:tg:ID:any`);
+    });
+
+    it("rejects an offer on a dimension that is not served", async () => {
+      // Only the MVP dimension is served by default.
+      const result = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+      expect(result).toEqual({
+        ok: false,
+        reason: "validation",
+        code: "INVALID_OFFER_CATALOG",
+      });
+      expect(gateway.offers.size).toBe(0);
+    });
+
+    it("rejects an offer on a dimension that exists but is disabled", async () => {
+      serveTelegram({ enabled: false });
+      const result = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+      expect(result).toEqual({
+        ok: false,
+        reason: "validation",
+        code: "INVALID_OFFER_CATALOG",
+      });
+    });
+
+    it("lets a second-dimension offer be repriced against its OWN dimension", async () => {
+      serveTelegram();
+      const created = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+      if (!created.ok) throw new Error("setup failed");
+
+      const updated = await service.updateOfferBasePrice({
+        caller: session(),
+        offerId: created.offer.id,
+        basePriceIdr: 2_000,
+        requestId: REQUEST_ID,
+      });
+
+      expect(updated.ok).toBe(true);
+      if (!updated.ok) return;
+      // Repriced by Telegram's override, not the global formula: 2000 + 500 +
+      // ceil(2000*3000/10000)=600 -> 3100, ceilTo(3100,100)=3100.
+      expect(updated.offer.pricing.retailPriceIdr).toBe(3_100);
+      expect(updated.offer.serviceCode).toBe("tg");
+      // The slot still matches the offer's own triple (the DB CHECK requires it).
+      const stored = gateway.offers.get(created.offer.id);
+      expect(stored?.activeDimensionKey).toBe(`${PARTNER_A}:tg:ID:any`);
+    });
+
+    it("keeps one active offer per (partner, dimension) independently per dimension", async () => {
+      serveTelegram();
+      const wa = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        requestId: REQUEST_ID,
+      });
+      const tg = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+
+      // Two active offers coexist because they occupy DIFFERENT slots.
+      expect(wa.ok).toBe(true);
+      expect(tg.ok).toBe(true);
+
+      // A second active offer on an ALREADY-claimed dimension still conflicts.
+      const duplicate = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_200,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+      expect(duplicate).toEqual({ ok: false, reason: "duplicate_active_offer" });
+    });
+
+    it("can always deactivate an offer whose dimension has been withdrawn", async () => {
+      serveTelegram();
+      const created = await service.createOffer({
+        caller: session(),
+        basePriceIdr: 1_000,
+        dimension: TELEGRAM_DIMENSION,
+        requestId: REQUEST_ID,
+      });
+      if (!created.ok) throw new Error("setup failed");
+
+      // The platform withdraws the dimension from sale.
+      serveTelegram({ enabled: false });
+
+      // Deactivation must stay possible — withdrawing supply is never blocked.
+      const deactivated = await service.deactivateOffer({
+        caller: session(),
+        offerId: created.offer.id,
+        requestId: REQUEST_ID,
+      });
+      expect(deactivated.ok).toBe(true);
+
+      // Re-activating it is refused while the dimension is not served.
+      const reactivated = await service.activateOffer({
+        caller: session(),
+        offerId: created.offer.id,
+        requestId: REQUEST_ID,
+      });
+      expect(reactivated).toEqual({
+        ok: false,
+        reason: "validation",
+        code: "INVALID_OFFER_CATALOG",
+      });
     });
   });
 });

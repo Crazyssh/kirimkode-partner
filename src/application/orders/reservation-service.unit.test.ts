@@ -18,6 +18,8 @@ import { ReservationService, type ReserveCommandInput } from "./reservation-serv
 import {
   DuplicateBuyerOrderRefError,
   ReservationContentionError,
+  type CatalogDimension,
+  type DimensionLookup,
   type CommitReservationInput,
   type LockedReservationCandidate,
   type ReservationConfig,
@@ -43,6 +45,13 @@ const CONFIG: ReservationConfig = Object.freeze({
 
 const FILTER: InventoryFilter = Object.freeze({
   serviceCode: "wa",
+  countryCode: "ID",
+  operatorCode: "any",
+});
+
+/** A SECOND catalog dimension, impossible to reserve before catalog membership. */
+const TELEGRAM_FILTER: InventoryFilter = Object.freeze({
+  serviceCode: "tg",
   countryCode: "ID",
   operatorCode: "any",
 });
@@ -105,15 +114,36 @@ class FakeStore implements IdempotencyStore<Tx> {
   }
 }
 
+/** The served catalog: the MVP dimension, enabled with no pricing overrides. */
+const MVP_DIMENSION: CatalogDimension = Object.freeze({
+  serviceCode: "wa",
+  countryCode: "ID",
+  operatorCode: "any",
+  enabled: true,
+});
+
 class FakeReservationGateway implements ReservationGateway<Tx> {
   config: ReservationConfig | null = CONFIG;
   candidates: LockedReservationCandidate[] = [];
+  dimensions: CatalogDimension[] = [MVP_DIMENSION];
   readonly committed: CommitReservationInput[] = [];
   readonly duplicateRefs = new Set<string>();
   contention = false;
 
   async loadActiveConfig(): Promise<ReservationConfig | null> {
     return this.config;
+  }
+  async loadDimension(_tx: Tx, filter: InventoryFilter): Promise<DimensionLookup> {
+    return {
+      declared: this.dimensions.length > 0,
+      dimension:
+        this.dimensions.find(
+          (dimension) =>
+            dimension.serviceCode === filter.serviceCode &&
+            dimension.countryCode === filter.countryCode &&
+            dimension.operatorCode === filter.operatorCode,
+        ) ?? null,
+    };
   }
   async lockEligibleCandidates(): Promise<readonly LockedReservationCandidate[]> {
     return this.candidates;
@@ -130,7 +160,10 @@ class FakeReservationGateway implements ReservationGateway<Tx> {
 function lockedCandidate(overrides: {
   numberId: string;
   basePriceIdr: number;
+  /** Which dimension the candidate's number + offer belong to. */
+  filter?: InventoryFilter;
 }): LockedReservationCandidate {
+  const dimension = overrides.filter ?? FILTER;
   const candidate: InventoryCandidate = {
     numberId: overrides.numberId,
     partnerStatus: "approved",
@@ -143,14 +176,14 @@ function lockedCandidate(overrides: {
     number: {
       status: "available",
       enabled: true,
-      countryCode: "ID",
-      operatorCode: "any",
+      countryCode: dimension.countryCode,
+      operatorCode: dimension.operatorCode,
       hasActiveOrder: false,
     },
     offer: {
-      serviceCode: "wa",
-      countryCode: "ID",
-      operatorCode: "any",
+      serviceCode: dimension.serviceCode,
+      countryCode: dimension.countryCode,
+      operatorCode: dimension.operatorCode,
       basePriceIdr: overrides.basePriceIdr,
       status: "active",
     },
@@ -272,13 +305,13 @@ describe("ReservationService", () => {
     expect(gateway.committed).toHaveLength(0);
   });
 
-  it("rejects a filter outside the configured catalog", async () => {
+  it("rejects a filter for a dimension the platform does not serve", async () => {
     const result = await service.reserve(
       baseCommand({
         request: {
           buyerOrderRef: "buyer-order-1",
           buyerAccountRef: "buyer-acct-1",
-          filter: { serviceCode: "tg", countryCode: "ID", operatorCode: "any" },
+          filter: TELEGRAM_FILTER,
           quoteVersion: 1,
         },
       }),
@@ -287,6 +320,78 @@ describe("ReservationService", () => {
     expect(result.statusCode).toBe(404);
     expect((result.body as { error: { code: string } }).error.code).toBe("CATALOG_UNAVAILABLE");
     expect(gateway.committed).toHaveLength(0);
+  });
+
+  it("rejects a dimension that exists but is disabled with the same error code", async () => {
+    gateway.dimensions = [
+      MVP_DIMENSION,
+      { ...TELEGRAM_FILTER, enabled: false },
+    ];
+    gateway.candidates = [
+      lockedCandidate({ numberId: "n-a", basePriceIdr: 1_000, filter: TELEGRAM_FILTER }),
+    ];
+
+    const result = await service.reserve(
+      baseCommand({
+        request: {
+          buyerOrderRef: "buyer-order-1",
+          buyerAccountRef: "buyer-acct-1",
+          filter: TELEGRAM_FILTER,
+          quoteVersion: 1,
+        },
+      }),
+    );
+
+    expect(result.statusCode).toBe(404);
+    expect((result.body as { error: { code: string } }).error.code).toBe("CATALOG_UNAVAILABLE");
+    expect(gateway.committed).toHaveLength(0);
+  });
+
+  it("reserves a SECOND enabled dimension and snapshots ITS pricing override", async () => {
+    gateway.dimensions = [
+      MVP_DIMENSION,
+      // A dearer dimension: bigger fee/markup, coarser rounding.
+      { ...TELEGRAM_FILTER, enabled: true, fixedFeeIdr: 500, markupBps: 3_000, roundToIdr: 100 },
+    ];
+    gateway.candidates = [
+      lockedCandidate({ numberId: "n-a", basePriceIdr: 1_000, filter: TELEGRAM_FILTER }),
+    ];
+
+    const result = await service.reserve(
+      baseCommand({
+        request: {
+          buyerOrderRef: "buyer-order-1",
+          buyerAccountRef: "buyer-acct-1",
+          filter: TELEGRAM_FILTER,
+          // The quote version is the GLOBAL config version, not a per-dimension one.
+          quoteVersion: 1,
+        },
+      }),
+    );
+
+    expect(result.statusCode).toBe(200);
+    if (!("data" in result.body)) throw new Error("expected a reserved order");
+    const { snapshot } = result.body.data;
+    // The snapshot carries the SECOND dimension, not the config's own.
+    expect(snapshot.serviceCode).toBe("tg");
+    expect(snapshot.countryCode).toBe("ID");
+    expect(snapshot.operatorCode).toBe("any");
+    // Priced by the override: 1000 + 500 + ceil(1000*3000/10000)=300 -> 1800.
+    expect(snapshot.retailPriceIdr).toBe(1_800);
+    expect(snapshot.payoutIdr).toBe(1_000);
+    expect(snapshot.platformMarginIdr).toBe(800);
+    // Currency and config version stay global (single-sourced on the config).
+    expect(snapshot.currency).toBe("IDR");
+    expect(snapshot.configVersion).toBe(1);
+
+    // The money path records exactly what was charged, and stays zero-sum.
+    expect(gateway.committed).toHaveLength(1);
+    const committed = gateway.committed[0];
+    expect(committed?.snapshot.retailPriceIdr).toBe(1_800);
+    expect(committed?.snapshot.payoutIdr).toBe(1_000);
+    expect(
+      (committed?.snapshot.payoutIdr ?? 0) + (committed?.snapshot.platformMarginIdr ?? 0),
+    ).toBe(committed?.snapshot.retailPriceIdr);
   });
 
   it("requires an idempotency key for the mutation", async () => {

@@ -16,11 +16,13 @@ import type {
   DeviceCapabilities,
   DeviceStatus,
   DeviceType,
+  DimensionLookup,
   InventoryCandidate,
   InventoryFilter,
   NumberStatus,
 } from "@domain/task-5-2-device-inventory-pricing";
 
+import { readCatalogDimension } from "./catalog-dimension-reader";
 import type { PartnerTransactionClient } from "./client";
 
 const DEVICE_TYPE_FROM_DB: Readonly<Record<$Enums.PartnerDeviceType, DeviceType>> = {
@@ -134,6 +136,18 @@ export class PrismaReservationGateway
       heartbeatTimeoutSeconds: config.heartbeatTimeoutSeconds,
       orderTimeoutSeconds: config.orderTimeoutSeconds,
     };
+  }
+
+  /**
+   * The requested dimension, read on the reserve transaction so it cannot change
+   * between the membership check and the snapshot write. Only the one dimension
+   * being reserved is loaded; the domain decides whether it is served.
+   */
+  loadDimension(
+    tx: PartnerTransactionClient,
+    filter: InventoryFilter,
+  ): Promise<DimensionLookup> {
+    return readCatalogDimension(tx, filter);
   }
 
   async lockEligibleCandidates(

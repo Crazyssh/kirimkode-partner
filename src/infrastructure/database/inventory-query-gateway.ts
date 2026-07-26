@@ -2,14 +2,17 @@ import { $Enums } from "@/generated/prisma";
 
 import type { InventoryQueryGateway, PlatformConfigSnapshot } from "@application/offers/ports";
 import type {
+  CatalogSnapshot,
   DeviceCapabilities,
   DeviceStatus,
   DeviceType,
+  DimensionLookup,
   InventoryCandidate,
   InventoryFilter,
   NumberStatus,
 } from "@domain/task-5-2-device-inventory-pricing";
 
+import { readCatalog, readCatalogDimension } from "./catalog-dimension-reader";
 import type { PartnerDatabaseExecutor } from "./client";
 import { readActivePlatformConfig } from "./platform-config-reader";
 
@@ -66,6 +69,14 @@ export class PrismaInventoryQueryGateway implements InventoryQueryGateway {
 
   loadActiveConfig(): Promise<PlatformConfigSnapshot | null> {
     return readActivePlatformConfig(this.client);
+  }
+
+  loadCatalog(): Promise<CatalogSnapshot> {
+    return readCatalog(this.client);
+  }
+
+  loadDimension(filter: InventoryFilter): Promise<DimensionLookup> {
+    return readCatalogDimension(this.client, filter);
   }
 
   async loadCandidates(filter: InventoryFilter): Promise<readonly InventoryCandidate[]> {

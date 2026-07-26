@@ -64,6 +64,7 @@ export { PrismaOperationalQueryGateway } from "./portal-operational-gateway";
 export { PrismaReservationGateway, RESERVE_LOCK_LIMIT } from "./reservation-gateway";
 export { PrismaOrderOperationsGateway } from "./order-operations-gateway";
 export { readActivePlatformConfig } from "./platform-config-reader";
+export { readCatalog, readCatalogDimension } from "./catalog-dimension-reader";
 export { PrismaAuthIdentityGateway } from "./auth-identity-repository";
 export { PrismaSessionGateway } from "./partner-session-repository";
 export { PrismaAdminIdentityGateway } from "./admin-identity-repository";

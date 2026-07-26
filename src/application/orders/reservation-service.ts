@@ -32,6 +32,8 @@
  */
 import {
   calculateAuthoritativePricing,
+  resolveDimensionPricing,
+  resolveServedDimension,
   selectEligibleInventory,
   type InventoryFilter,
 } from "@domain/task-5-2-device-inventory-pricing";
@@ -45,7 +47,6 @@ import {
   type Clock,
   type IdGenerator,
   type OrderSnapshotData,
-  type ReservationConfig,
   type ReservationGateway,
 } from "./ports";
 
@@ -199,12 +200,31 @@ export class ReservationService<Tx> {
       throw new DependencyUnavailableError();
     }
 
-    if (!matchesCatalog(request.filter, config)) {
+    // The filter is matched by MEMBERSHIP of the served catalog, not equality
+    // with the config's own dimension, so every enabled dimension is
+    // reservable. An absent OR disabled dimension is the same client-visible
+    // outcome as before: the catalog is not served. When no catalog has been
+    // declared at all the config's own dimension is served, so a database that
+    // was migrated before its config was seeded still sells.
+    const lookup = await this.deps.gateway.loadDimension(tx, request.filter);
+    const dimension = resolveServedDimension(lookup, config, request.filter);
+    if (dimension === null) {
       return effectError(CATALOG_UNAVAILABLE);
     }
+    // The quote version stays the GLOBAL config version. The quote's price is a
+    // function of (global config, that dimension's immutable overrides), and the
+    // overrides cannot change without a new config version (enforced by the
+    // `catalog_dimensions` immutability trigger), so one global version still
+    // expires every outstanding quote exactly as it did before. A per-dimension
+    // version would silently stop expiring quotes for dimensions that inherit
+    // the global price when a new config is published.
     if (request.quoteVersion !== config.version) {
       return effectError(QUOTE_EXPIRED);
     }
+    // Pricing in force for THIS dimension: the global config with the
+    // dimension's overrides applied. Global values (currency, version, order
+    // timeout, heartbeat window) still come from the config row alone.
+    const pricingConfig = resolveDimensionPricing(dimension, config);
 
     const now = this.deps.clock.nowEpochMs();
     const locked = await this.deps.gateway.lockEligibleCandidates(tx, request.filter);
@@ -223,14 +243,18 @@ export class ReservationService<Tx> {
     // The selector only ever returns a candidate that came from `locked`.
     if (winner === undefined) throw new DependencyUnavailableError();
 
+    // The snapshot records the authoritative pricing ACTUALLY used, so a
+    // dimension carrying an override is snapshotted at the override that was in
+    // force at reserve time (requirement 9.5) and the ledger stays zero-sum
+    // against it.
     const pricing = calculateAuthoritativePricing(
       { basePriceIdr: winner.basePriceIdr },
-      config,
+      pricingConfig,
     );
     const snapshot: OrderSnapshotData = {
-      serviceCode: config.serviceCode,
-      countryCode: config.countryCode,
-      operatorCode: config.operatorCode,
+      serviceCode: dimension.serviceCode,
+      countryCode: dimension.countryCode,
+      operatorCode: dimension.operatorCode,
       canonicalNumber: winner.canonicalNumber,
       basePriceIdr: winner.basePriceIdr,
       retailPriceIdr: pricing.retailPriceIdr,
@@ -310,15 +334,6 @@ export class ReservationService<Tx> {
     };
     return { statusCode: 200, response: { data: view } };
   }
-}
-
-/** The filter must match the single configured MVP catalog dimension. */
-function matchesCatalog(filter: InventoryFilter, config: ReservationConfig): boolean {
-  return (
-    filter.serviceCode === config.serviceCode &&
-    filter.countryCode === config.countryCode &&
-    filter.operatorCode === config.operatorCode
-  );
 }
 
 function effectError(error: SafeError): { statusCode: number; response: ReserveResponseBody } {

@@ -405,6 +405,148 @@ export function calculateAuthoritativePricing(
   });
 }
 
+/**
+ * One catalog dimension the platform offers, with OPTIONAL pricing overrides.
+ *
+ * The platform used to serve exactly one dimension because the dimension lived
+ * on the single active platform config row, so every check compared a dimension
+ * for EQUALITY with that row. A dimension is now a first-class value: the
+ * catalog is a SET of these, and a dimension is served when it is present and
+ * `enabled`.
+ *
+ * An `undefined`/absent override inherits the global config's value, so a
+ * dimension declared with no overrides prices exactly like the global config.
+ * Only the inputs {@link calculateAuthoritativePricing} consumes are
+ * overridable; `currency` and `version` stay global because the ledger,
+ * earnings, and payouts are denominated once for the whole platform.
+ */
+export interface CatalogDimension {
+  readonly serviceCode: string;
+  readonly countryCode: string;
+  readonly operatorCode: string;
+  readonly enabled: boolean;
+  readonly minBasePriceIdr?: number | null;
+  readonly maxBasePriceIdr?: number | null;
+  readonly fixedFeeIdr?: number | null;
+  readonly markupBps?: number | null;
+  readonly roundToIdr?: number | null;
+}
+
+/** True when `dimension` is the catalog dimension `filter` asks for. */
+export function dimensionMatches(dimension: CatalogDimension, filter: InventoryFilter): boolean {
+  return (
+    dimension.serviceCode === filter.serviceCode &&
+    dimension.countryCode === filter.countryCode &&
+    dimension.operatorCode === filter.operatorCode
+  );
+}
+
+/** True when a resolved dimension exists and is currently served. */
+export function isDimensionServed(dimension: CatalogDimension | null): boolean {
+  return dimension !== null && dimension.enabled;
+}
+
+/**
+ * A lookup of ONE catalog dimension, plus whether the platform has declared any
+ * dimension at all.
+ *
+ * `declared` exists to make the "no catalog yet" state unambiguous, and it
+ * matters for real deployments: the documented order is to run the migration and
+ * only then seed the config, so a fresh install briefly has a config with an
+ * empty dimension table. Treating that as "nothing is served" would leave the
+ * platform unable to sell anything, so it is instead read as "serve the config's
+ * own dimension" — precisely the behaviour before the catalog existed.
+ */
+export interface DimensionLookup {
+  /** The row for the requested triple, or `null` when there is none. */
+  readonly dimension: CatalogDimension | null;
+  /** False when NO dimension row exists at all (catalog not yet declared). */
+  readonly declared: boolean;
+}
+
+/** The whole served catalog, with the same `declared` signal. */
+export interface CatalogSnapshot {
+  readonly dimensions: readonly CatalogDimension[];
+  readonly declared: boolean;
+}
+
+/**
+ * The dimensions actually served: the declared catalog, or — when nothing has
+ * been declared — the active config's own dimension.
+ *
+ * Once ANY dimension row exists the table is authoritative, so an operator who
+ * declares a catalog is never silently overridden by the config's dimension.
+ */
+export function resolveServedCatalog(
+  snapshot: CatalogSnapshot,
+  config: PricingConfig,
+): readonly CatalogDimension[] {
+  return snapshot.declared ? snapshot.dimensions : [configDimension(config)];
+}
+
+/**
+ * The served dimension for one filter, applying the same undeclared-catalog
+ * fallback. Returns `null` when the dimension is absent or disabled, which every
+ * caller maps to its existing "catalog not served" error.
+ */
+export function resolveServedDimension(
+  lookup: DimensionLookup,
+  config: PricingConfig,
+  filter: InventoryFilter,
+): CatalogDimension | null {
+  if (!lookup.declared) {
+    const fallback = configDimension(config);
+    return dimensionMatches(fallback, filter) ? fallback : null;
+  }
+  return isDimensionServed(lookup.dimension) ? lookup.dimension : null;
+}
+
+/** The enabled dimension matching `filter`, or `null` when none is served. */
+export function findEnabledDimension(
+  dimensions: readonly CatalogDimension[],
+  filter: InventoryFilter,
+): CatalogDimension | null {
+  return (
+    dimensions.find((dimension) => dimension.enabled && dimensionMatches(dimension, filter)) ?? null
+  );
+}
+
+/**
+ * The pricing config in force for one dimension: the global config with the
+ * dimension's non-null overrides applied, and the dimension's own codes.
+ *
+ * The global values (`version`, `currency`) are never overridden, so the config
+ * row stays the single source for them — a dimension can only change the
+ * formula inputs the pricing calculation actually reads.
+ */
+export function resolveDimensionPricing(
+  dimension: CatalogDimension,
+  config: PricingConfig,
+): PricingConfig {
+  return Object.freeze({
+    version: config.version,
+    serviceCode: dimension.serviceCode,
+    countryCode: dimension.countryCode,
+    operatorCode: dimension.operatorCode,
+    currency: config.currency,
+    minBasePriceIdr: dimension.minBasePriceIdr ?? config.minBasePriceIdr,
+    maxBasePriceIdr: dimension.maxBasePriceIdr ?? config.maxBasePriceIdr,
+    fixedFeeIdr: dimension.fixedFeeIdr ?? config.fixedFeeIdr,
+    markupBps: dimension.markupBps ?? config.markupBps,
+    roundToIdr: dimension.roundToIdr ?? config.roundToIdr,
+  });
+}
+
+/** The dimension a config row describes, as an always-enabled dimension. */
+export function configDimension(config: PricingConfig): CatalogDimension {
+  return Object.freeze({
+    serviceCode: config.serviceCode,
+    countryCode: config.countryCode,
+    operatorCode: config.operatorCode,
+    enabled: true,
+  });
+}
+
 export interface OfferInput {
   readonly serviceCode: string;
   readonly countryCode: string;
@@ -418,28 +560,42 @@ export interface ValidatedOffer extends OfferInput {
   readonly configVersion: number;
 }
 
+/**
+ * Validate an offer against the partner's status and the served catalog.
+ *
+ * The offer's dimension is checked by MEMBERSHIP of `dimensions` (any enabled
+ * dimension is acceptable), not by equality with the config's own dimension, so
+ * a partner may offer any dimension the platform currently serves. Pricing is
+ * computed from the config with that dimension's overrides applied, so an
+ * offer on a dimension carrying an override is priced by the override while a
+ * dimension without one keeps the global price.
+ *
+ * `dimensions` defaults to the config's own dimension, which reproduces the
+ * previous single-dimension behaviour exactly for callers that do not supply a
+ * catalog. A dimension that is absent or disabled keeps the existing
+ * `INVALID_OFFER_CATALOG` error code.
+ */
 export function validateOffer(
   partnerStatus: PartnerStatus,
   offer: OfferInput,
   config: PricingConfig = MVP_PRICING_CONFIG,
+  dimensions: readonly CatalogDimension[] = [configDimension(config)],
 ): ValidatedOffer {
   validatePricingConfig(config);
   if (partnerStatus !== "approved") {
     throw new Task52DomainError("PARTNER_NOT_APPROVED", "Only approved partners may create offers");
   }
-  if (
-    offer.serviceCode !== config.serviceCode ||
-    offer.countryCode !== config.countryCode ||
-    offer.operatorCode !== config.operatorCode
-  ) {
+  const dimension = findEnabledDimension(dimensions, offer);
+  if (dimension === null) {
     throw new Task52DomainError(
       "INVALID_OFFER_CATALOG",
-      "Offer dimensions must match the configured catalog",
+      "Offer dimensions must match an enabled catalog dimension",
     );
   }
+  const pricingConfig = resolveDimensionPricing(dimension, config);
   return Object.freeze({
     ...offer,
-    pricing: calculateAuthoritativePricing({ basePriceIdr: offer.basePriceIdr }, config),
+    pricing: calculateAuthoritativePricing({ basePriceIdr: offer.basePriceIdr }, pricingConfig),
     configVersion: config.version,
   });
 }

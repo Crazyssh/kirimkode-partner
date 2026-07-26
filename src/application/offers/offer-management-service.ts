@@ -1,8 +1,8 @@
 /**
  * PartnerOffer lifecycle commands (task 8.4).
  *
- * Create / update-base-price / activate / deactivate / delete an offer for the
- * MVP `wa/ID/any` catalog. Every command is a sensitive inventory operation
+ * Create / update-base-price / activate / deactivate / delete an offer for any
+ * SERVED catalog dimension. Every command is a sensitive inventory operation
  * gated by the pure permission matrix (task 5.1, `manage_inventory`), re-checks
  * the permission itself (defense-in-depth), operates only within the caller's
  * tenant scope (task 7.1 — a cross-tenant target is indistinguishable from a
@@ -12,7 +12,8 @@
  * All offer/pricing invariants come from the pure task 5.2 domain and the task
  * 5.7 config:
  *   - `validateOffer` requires the partner to be `approved` (requirement 8.1),
- *     matches the offer to the configured catalog, enforces the guardrail
+ *     matches the offer to an ENABLED catalog dimension (membership, not
+ *     equality with the config's own dimension), enforces the guardrail
  *     server-side, and computes the authoritative retail/payout from the base
  *     price (requirements 8.2, 8.3, 8.4, 8.6).
  *   - The client only ever supplies `basePriceIdr`; retail and payout are never
@@ -24,15 +25,23 @@
  *     (requirement 8.1) is enforced by the database `activeDimensionKey` unique
  *     slot; a collision surfaces as {@link ActiveOfferConflictError}.
  *
- * Weighted routing and non-MVP catalogs are intentionally out of scope; the
- * catalog dimensions are always taken from the active config, never the client.
+ * Weighted routing stays out of scope. A dimension is only ever accepted when it
+ * is present and enabled in the served catalog, so the client can select among
+ * the platform's own dimensions but can never invent one; every mutation on an
+ * existing offer is validated against that offer's OWN dimension, so an offer on
+ * a second dimension stays repriceable and activatable.
  */
 import {
   calculateAuthoritativePricing,
+  resolveDimensionPricing,
+  resolveServedCatalog,
   Task52DomainError,
   validateOffer,
+  type CatalogDimension,
+  type InventoryFilter,
   type OfferStatus,
   type PartnerStatus,
+  type PricingConfig,
   type PricingResult,
 } from "@domain/task-5-2-device-inventory-pricing";
 import { createAuditEvent, type AuditEventDescriptor } from "@domain/task-5-7";
@@ -55,6 +64,13 @@ export interface CreateOfferInput {
   readonly basePriceIdr: number;
   /** Whether the offer starts `active` (default) or `inactive`. */
   readonly activate?: boolean;
+  /**
+   * Which served catalog dimension the offer is for. Omitted means the active
+   * config's own dimension, which is what a single-dimension caller (the portal
+   * form) has always meant. A dimension that is not enabled is rejected with the
+   * existing `INVALID_OFFER_CATALOG` validation outcome.
+   */
+  readonly dimension?: InventoryFilter;
   /** Request identity for the audit trail (uuid). */
   readonly requestId: string;
 }
@@ -115,10 +131,20 @@ export class OfferManagementService {
     return this.deps.gateway.runInTenant(input.caller.tenant, async (tx) => {
       const context = await this.loadContext(tx);
       if (context === null) return { ok: false, reason: "config_unavailable" } as const;
-      const { partnerStatus, config } = context;
+      const { partnerStatus, config, dimensions } = context;
 
+      // Default to the config's own dimension so an existing single-dimension
+      // caller behaves exactly as before.
+      const target: InventoryFilter = input.dimension ?? dimensionOf(config);
       const status: OfferStatus = activate ? "active" : "inactive";
-      const validated = this.validate(partnerStatus, config, input.basePriceIdr, status);
+      const validated = this.validate(
+        partnerStatus,
+        config,
+        dimensions,
+        target,
+        input.basePriceIdr,
+        status,
+      );
       if (!validated.ok) return validated.outcome;
 
       const now = this.deps.clock.nowEpochMs();
@@ -127,15 +153,15 @@ export class OfferManagementService {
       try {
         record = await tx.insertOffer({
           id: offerId,
-          serviceCode: config.serviceCode,
-          countryCode: config.countryCode,
-          operatorCode: config.operatorCode,
+          serviceCode: target.serviceCode,
+          countryCode: target.countryCode,
+          operatorCode: target.operatorCode,
           basePriceIdr: input.basePriceIdr,
           status,
           configVersion: config.version,
           activeDimensionKey: activeDimensionKey(
             input.caller.tenant.partnerId,
-            config,
+            target,
             status,
           ),
           createdAtEpochMs: now,
@@ -156,7 +182,10 @@ export class OfferManagementService {
         now,
       });
 
-      return { ok: true, offer: this.toView(record, config) } as const;
+      return {
+        ok: true,
+        offer: this.toView(record, config, validated.pricingConfig),
+      } as const;
     });
   }
 
@@ -176,9 +205,20 @@ export class OfferManagementService {
 
       const context = await this.loadContext(tx);
       if (context === null) return { ok: false, reason: "config_unavailable" } as const;
-      const { partnerStatus, config } = context;
+      const { partnerStatus, config, dimensions } = context;
 
-      const validated = this.validate(partnerStatus, config, input.basePriceIdr, existing.status);
+      // Re-validate against the offer's OWN dimension, not the config's: an
+      // offer on a second served dimension must stay repriceable, and the
+      // `activeDimensionKey` slot has to keep matching the offer's own triple
+      // (the database CHECK constraint requires exactly that).
+      const validated = this.validate(
+        partnerStatus,
+        config,
+        dimensions,
+        dimensionOf(existing),
+        input.basePriceIdr,
+        existing.status,
+      );
       if (!validated.ok) return validated.outcome;
 
       const now = this.deps.clock.nowEpochMs();
@@ -188,7 +228,7 @@ export class OfferManagementService {
         configVersion: config.version,
         activeDimensionKey: activeDimensionKey(
           input.caller.tenant.partnerId,
-          config,
+          dimensionOf(existing),
           existing.status,
         ),
       });
@@ -204,7 +244,10 @@ export class OfferManagementService {
         now,
       });
 
-      return { ok: true, offer: this.toView(record.record, config) } as const;
+      return {
+        ok: true,
+        offer: this.toView(record.record, config, validated.pricingConfig),
+      } as const;
     });
   }
 
@@ -236,7 +279,10 @@ export class OfferManagementService {
       const existing = await tx.findOfferById(input.offerId);
       if (existing === null) return { ok: false, reason: "not_found" } as const;
 
-      const config = await tx.loadActiveConfig();
+      const [config, lookup] = await Promise.all([
+        tx.loadActiveConfig(),
+        tx.loadDimension(dimensionOf(existing)),
+      ]);
 
       try {
         await tx.deleteOfferById(existing.id);
@@ -259,9 +305,17 @@ export class OfferManagementService {
 
       // Report the deleted offer using its own snapshot config version when the
       // active config is unavailable, so the response never fabricates pricing.
-      const pricingConfig = config ?? undefined;
-      const offer: OfferView = pricingConfig
-        ? this.toView(existing, pricingConfig)
+      // Its own dimension's overrides are applied when it still has a row, even
+      // if that dimension has since been disabled — the view must show the price
+      // the offer actually carried, not a re-based global one.
+      const offer: OfferView = config
+        ? this.toView(
+            existing,
+            config,
+            lookup.dimension === null
+              ? config
+              : resolveDimensionPricing(lookup.dimension, config),
+          )
         : {
             ...existing,
             currency: "IDR",
@@ -285,14 +339,25 @@ export class OfferManagementService {
 
       const context = await this.loadContext(tx);
       if (context === null) return { ok: false, reason: "config_unavailable" } as const;
-      const { partnerStatus, config } = context;
+      const { partnerStatus, config, dimensions } = context;
 
-      // Activation re-checks partner approval + guardrail; deactivation only
-      // needs the guardrail to stay well-formed but re-runs validation for a
-      // single authority path.
+      // Activation re-checks partner approval + guardrail against the offer's
+      // OWN dimension; a dimension that has since been withdrawn cannot be
+      // re-activated (existing `INVALID_OFFER_CATALOG` outcome). Deactivation
+      // only needs a well-formed guardrail, so it does not re-check membership —
+      // withdrawing supply must always remain possible.
+      let pricingConfig = this.pricingFor(config, dimensions, dimensionOf(existing));
       if (status === "active") {
-        const validated = this.validate(partnerStatus, config, existing.basePriceIdr, status);
+        const validated = this.validate(
+          partnerStatus,
+          config,
+          dimensions,
+          dimensionOf(existing),
+          existing.basePriceIdr,
+          status,
+        );
         if (!validated.ok) return validated.outcome;
+        pricingConfig = validated.pricingConfig;
       }
 
       const now = this.deps.clock.nowEpochMs();
@@ -300,7 +365,11 @@ export class OfferManagementService {
         basePriceIdr: existing.basePriceIdr,
         status,
         configVersion: config.version,
-        activeDimensionKey: activeDimensionKey(input.caller.tenant.partnerId, config, status),
+        activeDimensionKey: activeDimensionKey(
+          input.caller.tenant.partnerId,
+          dimensionOf(existing),
+          status,
+        ),
       });
       if (!record.ok) return record.outcome;
 
@@ -313,7 +382,7 @@ export class OfferManagementService {
         now,
       });
 
-      return { ok: true, offer: this.toView(record.record, config) } as const;
+      return { ok: true, offer: this.toView(record.record, config, pricingConfig) } as const;
     });
   }
 
@@ -333,48 +402,96 @@ export class OfferManagementService {
     }
   }
 
-  /** Load the partner status + active config used by every command. */
-  private async loadContext(
-    tx: OfferManagementTransaction,
-  ): Promise<{ partnerStatus: PartnerStatus; config: PlatformConfigSnapshot } | null> {
-    const [partnerStatus, config] = await Promise.all([
+  /**
+   * Load the partner status, active config, and served catalog every command
+   * needs. The config remains the single source for the global values; the
+   * dimension list only says which dimensions are served and how they override
+   * the pricing inputs.
+   */
+  private async loadContext(tx: OfferManagementTransaction): Promise<{
+    partnerStatus: PartnerStatus;
+    config: PlatformConfigSnapshot;
+    dimensions: readonly CatalogDimension[];
+  } | null> {
+    const [partnerStatus, config, catalog] = await Promise.all([
       tx.loadPartnerStatus(),
       tx.loadActiveConfig(),
+      tx.loadCatalog(),
     ]);
     if (partnerStatus === null || config === null) return null;
-    return { partnerStatus, config };
+    // An undeclared catalog serves the config's own dimension, so a database
+    // migrated before its config was seeded behaves exactly as it did before.
+    return { partnerStatus, config, dimensions: resolveServedCatalog(catalog, config) };
   }
 
-  /** Run the pure `validateOffer` and translate its failure to an outcome. */
+  /**
+   * Run the pure `validateOffer` for one dimension and translate its failure to
+   * an outcome. On success it also returns the pricing config in force for that
+   * dimension, so the caller's view reports the same numbers validation used.
+   */
   private validate(
     partnerStatus: PartnerStatus,
     config: PlatformConfigSnapshot,
+    dimensions: readonly CatalogDimension[],
+    dimension: InventoryFilter,
     basePriceIdr: number,
     status: OfferStatus,
-  ): { ok: true } | { ok: false; outcome: OfferCommandOutcome } {
+  ):
+    | { ok: true; pricingConfig: PricingConfig }
+    | { ok: false; outcome: OfferCommandOutcome } {
     try {
       validateOffer(
         partnerStatus,
         {
-          serviceCode: config.serviceCode,
-          countryCode: config.countryCode,
-          operatorCode: config.operatorCode,
+          serviceCode: dimension.serviceCode,
+          countryCode: dimension.countryCode,
+          operatorCode: dimension.operatorCode,
           basePriceIdr,
           status,
         },
         config,
+        dimensions,
       );
-      return { ok: true };
+      return { ok: true, pricingConfig: this.pricingFor(config, dimensions, dimension) };
     } catch (error) {
       return { ok: false, outcome: mapValidationError(error) };
     }
   }
 
-  private toView(record: OfferRecord, config: PlatformConfigSnapshot): OfferView {
+  /**
+   * The pricing config in force for a dimension: the global config with that
+   * dimension's overrides applied, falling back to the bare global config when
+   * the dimension is not in the served set (a deactivation path, or a legacy
+   * offer whose dimension has been withdrawn).
+   */
+  private pricingFor(
+    config: PlatformConfigSnapshot,
+    dimensions: readonly CatalogDimension[],
+    dimension: InventoryFilter,
+  ): PricingConfig {
+    const served = dimensions.find(
+      (candidate) =>
+        candidate.serviceCode === dimension.serviceCode &&
+        candidate.countryCode === dimension.countryCode &&
+        candidate.operatorCode === dimension.operatorCode,
+    );
+    return served === undefined ? config : resolveDimensionPricing(served, config);
+  }
+
+  /**
+   * Project an offer row onto its view. `currency` always comes from the global
+   * config; the retail/payout numbers come from the offer's own dimension
+   * pricing so an overridden dimension reports its real price.
+   */
+  private toView(
+    record: OfferRecord,
+    config: PlatformConfigSnapshot,
+    pricingConfig: PricingConfig = config,
+  ): OfferView {
     return {
       ...record,
       currency: config.currency,
-      pricing: calculateAuthoritativePricing({ basePriceIdr: record.basePriceIdr }, config),
+      pricing: calculateAuthoritativePricing({ basePriceIdr: record.basePriceIdr }, pricingConfig),
     };
   }
 
@@ -433,19 +550,30 @@ interface OfferMutationArgs {
   readonly activeDimensionKey: string | null;
 }
 
+/** The catalog dimension triple carried by a config row or an offer row. */
+function dimensionOf(source: InventoryFilter): InventoryFilter {
+  return {
+    serviceCode: source.serviceCode,
+    countryCode: source.countryCode,
+    operatorCode: source.operatorCode,
+  };
+}
+
 /**
  * Build the global active-dimension slot value. It mirrors the database check
  * constraint (`${partnerId}:${service}:${country}:${operator}` while active,
  * `null` otherwise), so the application and the schema agree on the uniqueness
- * key without the adapter re-deriving it.
+ * key without the adapter re-deriving it. The dimension is the OFFER's own
+ * triple, which is what the constraint compares against — deriving it from the
+ * active config instead would make any offer outside that dimension unwritable.
  */
 function activeDimensionKey(
   partnerId: string,
-  config: PlatformConfigSnapshot,
+  dimension: InventoryFilter,
   status: OfferStatus,
 ): string | null {
   return status === "active"
-    ? `${partnerId}:${config.serviceCode}:${config.countryCode}:${config.operatorCode}`
+    ? `${partnerId}:${dimension.serviceCode}:${dimension.countryCode}:${dimension.operatorCode}`
     : null;
 }
 

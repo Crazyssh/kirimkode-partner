@@ -342,6 +342,57 @@ model PlatformConfig {
   @@map("platform_configs")
 }
 
+/// The catalog dimensions the platform currently offers (service / country /
+/// operator), decoupled from the single active {@link PlatformConfig} row.
+///
+/// `platform_configs` mixes ONE catalog dimension with the platform-wide
+/// operational values (heartbeat windows, `earningHoldSeconds`,
+/// `minimumPayoutIdr`, retention windows, the pricing formula inputs). Adding a
+/// second dimension as another config row would duplicate those global values
+/// per dimension and let money-path numbers silently diverge, so the dimension
+/// list lives here instead and the global values stay single-sourced in
+/// `platform_configs`. Offer validation, the inventory quote, and reserve match
+/// a dimension by MEMBERSHIP of this table rather than equality with the config
+/// row.
+///
+/// The pricing columns are OPTIONAL overrides: a NULL column falls back to the
+/// active config's value, so a dimension added with all-NULL overrides prices
+/// exactly like the global config. Only the inputs
+/// `calculateAuthoritativePricing` actually consumes are overridable
+/// (guardrail min/max, fixed fee, markup, rounding unit); `currency` and
+/// `version` stay global because the ledger, earnings, and payouts are
+/// denominated once for the whole platform.
+///
+/// The dimension triple and the pricing overrides are IMMUTABLE after insert
+/// (enforced by a trigger in the migration): a buyer's quote carries the global
+/// `platform_configs.version` as its `quoteVersion`, so letting an override
+/// change under a live quote would silently break `QUOTE_EXPIRED` — the quote
+/// would still validate while the price it was computed from had moved. Only
+/// `enabled` is mutable, because withdrawing a dimension from sale is not a
+/// price change: it makes the dimension unreservable outright.
+model CatalogDimension {
+  id              String   @id @default(uuid()) @db.Uuid
+  serviceCode     String   @db.VarChar(32)
+  countryCode     String   @db.Char(2)
+  operatorCode    String   @db.VarChar(32)
+  /// Whether the dimension is served. A disabled dimension keeps its row (and
+  /// its history) but stops being quotable and reservable.
+  enabled         Boolean  @default(true)
+  /// Per-dimension pricing overrides. NULL = inherit the active config value.
+  minBasePriceIdr Int?
+  maxBasePriceIdr Int?
+  fixedFeeIdr     Int?
+  markupBps       Int?
+  roundToIdr      Int?
+  /// Why this dimension exists / who asked for it (operator-facing note).
+  note            String?  @db.VarChar(500)
+  createdAt       DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([serviceCode, countryCode, operatorCode])
+  @@map("catalog_dimensions")
+}
+
 model DeviceHeartbeat {
   id           String        @id @default(uuid()) @db.Uuid
   deviceId     String        @db.Uuid

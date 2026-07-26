@@ -18,12 +18,14 @@
  * order (requirement 9.4).
  */
 import type {
+  CatalogDimension,
+  DimensionLookup,
   InventoryCandidate,
   InventoryFilter,
 } from "@domain/task-5-2-device-inventory-pricing";
 import type { PlatformConfigSnapshot } from "@application/offers/ports";
 
-export type { InventoryFilter };
+export type { CatalogDimension, DimensionLookup, InventoryFilter };
 
 /** Source of the current time; injected so tests can use a fake clock. */
 export interface Clock {
@@ -140,6 +142,14 @@ export class ReservationContentionError extends Error {
 export interface ReservationGateway<Tx> {
   /** The immutable active platform config (pricing, liveness, order timeout). */
   loadActiveConfig(tx: Tx): Promise<ReservationConfig | null>;
+  /**
+   * The catalog dimension row for the requested filter, plus whether any
+   * dimension has been declared at all. Read on the reserve transaction so the
+   * dimension (and therefore the price) cannot change between the check and the
+   * snapshot write. Only ONE dimension is loaded rather than the whole catalog:
+   * reserve prices exactly the dimension it was asked for.
+   */
+  loadDimension(tx: Tx, filter: InventoryFilter): Promise<DimensionLookup>;
   /**
    * Select and row-lock the available candidates for the catalog filter with
    * `FOR UPDATE SKIP LOCKED`, ordered by `number.id ASC`, returning them with

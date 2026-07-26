@@ -14,18 +14,25 @@
  *
  * The quote is authoritative and server-computed (requirement 8.6): the retail
  * price comes from `calculateAuthoritativePricing` over the selected candidate's
- * base price and the immutable active {@link PlatformConfigSnapshot}. The quote
- * carries the config `version` as `quoteVersion` and an `expiresAt` so the
- * reservation path can reject a stale or superseded quote. No weighted routing:
- * the first candidate by `number.id ASC` defines the price (deterministic MVP).
+ * base price and the immutable active platform config, with the requested
+ * dimension's pricing overrides applied. The quote carries the GLOBAL config
+ * `version` as `quoteVersion` and an `expiresAt` so the reservation path can
+ * reject a stale or superseded quote. No weighted routing: the first candidate
+ * by `number.id ASC` defines the price (deterministic MVP).
+ *
+ * The requested dimension is matched by membership of the served catalog, so any
+ * enabled dimension can be quoted; a dimension that is absent or disabled keeps
+ * the existing `catalog_mismatch` outcome.
  */
 import {
   calculateAuthoritativePricing,
+  resolveDimensionPricing,
+  resolveServedDimension,
   selectEligibleInventory,
   type InventoryFilter,
 } from "@domain/task-5-2-device-inventory-pricing";
 
-import type { Clock, InventoryQueryGateway, PlatformConfigSnapshot } from "./ports";
+import type { Clock, InventoryQueryGateway } from "./ports";
 
 /**
  * Quote validity window in milliseconds. The MVP uses a short fixed window so a
@@ -79,11 +86,18 @@ export class InventoryQueryService {
     const config = await this.deps.gateway.loadActiveConfig();
     if (config === null) return { ok: false, reason: "config_unavailable" };
 
-    // The MVP serves a single catalog; a filter outside it can never match the
-    // configured supply, so we reject it rather than silently returning empty.
-    if (!matchesCatalog(input.filter, config)) {
+    // The platform serves a SET of catalog dimensions; a filter for a dimension
+    // that is not served (absent or disabled) can never match any supply, so we
+    // reject it rather than silently returning empty. The outcome is unchanged
+    // from the single-dimension behaviour — only the membership test is new.
+    const lookup = await this.deps.gateway.loadDimension(input.filter);
+    const dimension = resolveServedDimension(lookup, config, input.filter);
+    if (dimension === null) {
       return { ok: false, reason: "catalog_mismatch" };
     }
+    // Price for THIS dimension: the global config with the dimension's
+    // overrides applied. `currency` and the quote `version` stay global.
+    const pricingConfig = resolveDimensionPricing(dimension, config);
 
     const now = this.deps.clock.nowEpochMs();
     const nowDate = new Date(now);
@@ -111,7 +125,7 @@ export class InventoryQueryService {
 
     const pricing = calculateAuthoritativePricing(
       { basePriceIdr: selected.offer.basePriceIdr },
-      config,
+      pricingConfig,
     );
     return {
       ok: true,
@@ -124,13 +138,4 @@ export class InventoryQueryService {
       },
     };
   }
-}
-
-/** The filter must match the single configured MVP catalog dimension. */
-function matchesCatalog(filter: InventoryFilter, config: PlatformConfigSnapshot): boolean {
-  return (
-    filter.serviceCode === config.serviceCode &&
-    filter.countryCode === config.countryCode &&
-    filter.operatorCode === config.operatorCode
-  );
 }

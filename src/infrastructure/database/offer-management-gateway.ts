@@ -4,6 +4,9 @@ import {
   ActiveOfferConflictError,
   OfferInUseError,
   type AuditWriteInput,
+  type CatalogSnapshot,
+  type DimensionLookup,
+  type InventoryFilter,
   type NewOfferRecord,
   type OfferManagementGateway,
   type OfferManagementTransaction,
@@ -14,6 +17,7 @@ import {
 import type { OfferStatus, PartnerStatus } from "@domain/task-5-2-device-inventory-pricing";
 
 import { PrismaAuditEventRepository } from "./audit-event-repository";
+import { readCatalog, readCatalogDimension } from "./catalog-dimension-reader";
 import type { PartnerTransactionClient } from "./client";
 import { readActivePlatformConfig } from "./platform-config-reader";
 import { assertAffectedExactlyOne, scopedIdWhere } from "./tenant-scoping";
@@ -98,6 +102,14 @@ class PrismaOfferManagementTransaction implements OfferManagementTransaction {
 
   loadActiveConfig(): Promise<PlatformConfigSnapshot | null> {
     return readActivePlatformConfig(this.tx);
+  }
+
+  loadCatalog(): Promise<CatalogSnapshot> {
+    return readCatalog(this.tx);
+  }
+
+  loadDimension(filter: InventoryFilter): Promise<DimensionLookup> {
+    return readCatalogDimension(this.tx, filter);
   }
 
   async findOfferById(id: string): Promise<OfferRecord | null> {

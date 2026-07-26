@@ -25,6 +25,9 @@
  * the service maps to a stable `duplicate_active_offer` outcome.
  */
 import type {
+  CatalogDimension,
+  CatalogSnapshot,
+  DimensionLookup,
   InventoryCandidate,
   InventoryFilter,
   OfferStatus,
@@ -34,7 +37,15 @@ import type {
 import type { AuditEventDescriptor } from "@domain/task-5-7";
 import type { TenantContext } from "@infrastructure/database";
 
-export type { InventoryCandidate, InventoryFilter, OfferStatus, PartnerStatus };
+export type {
+  CatalogDimension,
+  CatalogSnapshot,
+  DimensionLookup,
+  InventoryCandidate,
+  InventoryFilter,
+  OfferStatus,
+  PartnerStatus,
+};
 
 /**
  * The immutable, versioned active platform config projected onto the shape the
@@ -48,6 +59,35 @@ export type { InventoryCandidate, InventoryFilter, OfferStatus, PartnerStatus };
 export interface PlatformConfigSnapshot extends PricingConfig {
   /** Heartbeat staleness threshold in seconds (device liveness). */
   readonly heartbeatTimeoutSeconds: number;
+}
+
+/**
+ * The served catalog: which service/country/operator dimensions the platform
+ * currently offers, each with its optional pricing overrides.
+ *
+ * This is deliberately a SEPARATE read from {@link PlatformConfigSnapshot}. The
+ * config row still single-sources every platform-wide value (pricing formula
+ * inputs, `currency`, heartbeat + order windows, and the money-path
+ * `earningHoldSeconds` / `minimumPayoutIdr`); the dimension list only says which
+ * dimensions those values are applied to, and may override the pricing inputs
+ * per dimension. Modelling dimensions as extra config rows would duplicate the
+ * global values per dimension and let money-path numbers diverge.
+ */
+export interface CatalogDimensionReader {
+  /**
+   * The enabled dimensions plus whether ANY dimension has been declared. The
+   * `declared` flag lets the domain distinguish "the platform serves nothing"
+   * from "no catalog has been declared yet", the latter falling back to the
+   * config's own dimension so a freshly-migrated database can still sell.
+   */
+  loadCatalog(): Promise<CatalogSnapshot>;
+  /**
+   * The dimension row for one triple regardless of its `enabled` flag, plus the
+   * same `declared` signal. A disabled row is returned (rather than `null`) so
+   * the caller can price an existing offer on a withdrawn dimension without
+   * having to invent a pricing config.
+   */
+  loadDimension(filter: InventoryFilter): Promise<DimensionLookup>;
 }
 
 /**
@@ -128,7 +168,7 @@ export interface AuditWriteInput {
  * Every read/write is folded with the tenant's `partnerId` (task 7.1), so a
  * cross-tenant id is indistinguishable from a missing row (`null`).
  */
-export interface OfferManagementTransaction {
+export interface OfferManagementTransaction extends CatalogDimensionReader {
   /** The caller's own partner status; gates offer creation (requirement 8.1). */
   loadPartnerStatus(): Promise<PartnerStatus | null>;
   /** The immutable active platform config (guardrail + pricing rules). */
@@ -160,7 +200,7 @@ export interface OfferManagementGateway {
  * aggregated across every approved partner. The adapter still keeps raw Prisma
  * internal and only returns pure-domain candidates + the active config.
  */
-export interface InventoryQueryGateway {
+export interface InventoryQueryGateway extends CatalogDimensionReader {
   /** The immutable active platform config (pricing + liveness window). */
   loadActiveConfig(): Promise<PlatformConfigSnapshot | null>;
   /**

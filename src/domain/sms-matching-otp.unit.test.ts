@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   decideSmsIngress,
+  foreignSenderMarkersForService,
   isForeignServiceSender,
   matchSmsToActiveOrder,
   parseServiceOtp,
+  SERVICE_OTP_REGISTRY,
+  THIRD_PARTY_SENDER_MARKERS,
   type SmsIngressPolicyInput,
   type SmsOrderCandidate,
 } from "./sms-matching-otp";
@@ -298,6 +301,221 @@ describe("Task 5.4 WhatsApp OTP parser", () => {
     });
     expect(parseServiceOtp("wa", "WhatsApp code 12345678")).toEqual({
       status: "rejected", reason: "no_candidate",
+    });
+  });
+});
+
+// **Validates: Requirements 11.7**
+describe("Task 5.4 per-service OTP parser registry", () => {
+  it("rejects a service code that is not in the registry", () => {
+    // Only the registry's short codes are supported; the spelled-out brand
+    // names and unknown codes stay unsupported so a mis-seeded order can never
+    // fall through to some other service's rules.
+    for (const serviceCode of ["telegram", "instagram", "google", "whatsapp", "sx", "", "toString"]) {
+      expect(parseServiceOtp(serviceCode, "WhatsApp code 123456")).toEqual({
+        status: "rejected", reason: "unsupported_service",
+      });
+    }
+  });
+
+  it("derives each service's foreign markers so its own brand is never foreign", () => {
+    // The safety property: a sender named after the service being parsed is the
+    // legitimate sender. Derived from the registry, so the two lists cannot drift.
+    for (const serviceCode of Object.keys(SERVICE_OTP_REGISTRY)) {
+      const markers = foreignSenderMarkersForService(serviceCode);
+      const ownMarkers = SERVICE_OTP_REGISTRY[serviceCode as keyof typeof SERVICE_OTP_REGISTRY]
+        .senderBrandMarkers;
+      for (const ownMarker of ownMarkers) {
+        expect(markers).not.toContain(ownMarker);
+      }
+      // Every other registered brand IS foreign here.
+      for (const [otherCode, otherSpec] of Object.entries(SERVICE_OTP_REGISTRY)) {
+        if (otherCode === serviceCode) continue;
+        for (const otherMarker of otherSpec.senderBrandMarkers) {
+          expect(markers).toContain(otherMarker);
+        }
+      }
+      // Brands the platform never sells stay foreign for everyone.
+      expect(markers).toContain("bca");
+    }
+    expect(foreignSenderMarkersForService("tg")).not.toContain("telegram");
+    expect(foreignSenderMarkersForService("tg")).toContain("whatsapp");
+    expect(foreignSenderMarkersForService("wa")).toContain("telegram");
+  });
+
+  it("keeps the sold brands and the never-sold brands disjoint", () => {
+    // The precondition behind the derivation: a brand the platform sells OTPs for
+    // must not also sit in the always-foreign list, or that service would treat
+    // its own sender as foreign and refuse every real OTP. Asserted here so
+    // adding a service that collides with the third-party list fails loudly.
+    const soldBrandMarkers = Object.values(SERVICE_OTP_REGISTRY)
+      .flatMap((spec) => spec.senderBrandMarkers);
+    for (const marker of soldBrandMarkers) {
+      expect(THIRD_PARTY_SENDER_MARKERS).not.toContain(marker);
+    }
+    // And no two services claim the same marker, which would make one of them
+    // foreign to itself.
+    expect(new Set(soldBrandMarkers).size).toBe(soldBrandMarkers.length);
+  });
+
+  it("parses a real Telegram login code as five digits", () => {
+    // Telegram login codes are FIVE digits (core.telegram.org/api/auth defines a
+    // login code as "a sequence of 5 to 7 decimal digits" and pins test DCs to
+    // the DC number "repeated five times"), so the `wa` six-digit rule would
+    // never have matched one.
+    expect(parseServiceOtp("tg", "Telegram code 51284")).toEqual({
+      status: "matched", otp: "51284",
+    });
+    const withWarning = [
+      "Telegram code: 51284",
+      "",
+      "Do not give this code to anyone, even if they say they are from Telegram!",
+    ].join("\n");
+    expect(parseServiceOtp("tg", withWarning)).toEqual({ status: "matched", otp: "51284" });
+  });
+
+  it("accepts Telegram's own sender and refuses another brand's for a tg order", () => {
+    const body = "Telegram code 51284";
+    // Regression guard for the misdelivery bug this registry exists to prevent:
+    // `telegram` is in the shared marker vocabulary, but for a `tg` order the
+    // Telegram sender is the legitimate one — refusing it would drop a real OTP.
+    for (const sender of ["Telegram", "TELEGRAM", "+6289911223344", "32665", ""]) {
+      expect(parseServiceOtp("tg", body, { sender })).toEqual({
+        status: "matched", otp: "51284",
+      });
+    }
+    for (const sender of ["WhatsApp", "GOOGLE", "Instagram", "InfoBCA"]) {
+      expect(parseServiceOtp("tg", body, { sender })).toEqual({
+        status: "rejected", reason: "foreign_sender",
+      });
+    }
+  });
+
+  it("does not let another service's OTP satisfy tg", () => {
+    // No brand word: a WhatsApp body is not a Telegram code.
+    expect(parseServiceOtp("tg", "Kode WhatsApp Anda: 482901")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    // Brand word present but the code is the wrong length: a six-digit foreign
+    // OTP quoted inside a Telegram-branded body must not be delivered as the
+    // five-digit Telegram code.
+    expect(parseServiceOtp("tg", "Telegram code 123456")).toEqual({
+      status: "rejected", reason: "no_candidate",
+    });
+    // The dashed wire format is WhatsApp-only: `tg` declares no grouped form.
+    expect(parseServiceOtp("tg", "Telegram code 123-45")).toEqual({
+      status: "rejected", reason: "no_candidate",
+    });
+    expect(parseServiceOtp("tg", "xTelegramx 51284")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+  });
+
+  it("applies the ambiguity and decoy guards to tg", () => {
+    expect(parseServiceOtp("tg", "Telegram code 51284 atau 40915")).toEqual({
+      status: "rejected", reason: "ambiguous_candidates",
+    });
+    expect(parseServiceOtp("tg", "Telegram code tel: 51284")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+  });
+
+  it("parses a real Instagram code SMS", () => {
+    // Verbatim reported shape (shortcode 32665): code first, then the app-hash
+    // line Android uses for autofill — which contributes no digits.
+    expect(
+      parseServiceOtp("ig", "<#> 682019 is your Instagram code. Don't share it. SIYRxKrru1t"),
+    ).toEqual({ status: "matched", otp: "682019" });
+    expect(parseServiceOtp("ig", "682019 is your Instagram code. Don't share it")).toEqual({
+      status: "matched", otp: "682019",
+    });
+  });
+
+  it("accepts Instagram's own sender and refuses another brand's for an ig order", () => {
+    const body = "682019 is your Instagram code. Don't share it";
+    for (const sender of ["Instagram", "INSTAGRAM", "32665", ""]) {
+      expect(parseServiceOtp("ig", body, { sender })).toEqual({
+        status: "matched", otp: "682019",
+      });
+    }
+    // `facebook` stays foreign for `ig` on purpose: shared ownership does not
+    // make a Facebook-sender SMS an Instagram code.
+    for (const sender of ["Telegram", "WhatsApp", "Facebook", "InfoBCA"]) {
+      expect(parseServiceOtp("ig", body, { sender })).toEqual({
+        status: "rejected", reason: "foreign_sender",
+      });
+    }
+  });
+
+  it("does not let another service's OTP satisfy ig, and guards ambiguity and decoys", () => {
+    expect(parseServiceOtp("ig", "Kode WhatsApp Anda: 482901")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("ig", "G-123456 is your Google verification code")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    // Grouped form is WhatsApp-only, so WA's dashed wire code is no ig candidate.
+    expect(parseServiceOtp("ig", "Instagram code 718-891")).toEqual({
+      status: "rejected", reason: "no_candidate",
+    });
+    expect(parseServiceOtp("ig", "682019 is your Instagram code, backup 731904")).toEqual({
+      status: "rejected", reason: "ambiguous_candidates",
+    });
+    expect(parseServiceOtp("ig", "Instagram code nomor: 081234")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+  });
+
+  it("parses a real Google verification code behind its G- prefix", () => {
+    // "G-491052 is your Google verification code" is the most-reported Google
+    // shape. The prefix needs no rule: `-` is not a digit, so the six digits
+    // after it are already an intact candidate — and codes that arrive without
+    // the prefix still parse instead of being refused.
+    expect(parseServiceOtp("go", "G-491052 is your Google verification code")).toEqual({
+      status: "matched", otp: "491052",
+    });
+    expect(parseServiceOtp("go", "Your Google verification code is 491052")).toEqual({
+      status: "matched", otp: "491052",
+    });
+  });
+
+  it("accepts Google's own sender and refuses another brand's for a go order", () => {
+    const body = "G-491052 is your Google verification code";
+    for (const sender of ["Google", "GOOGLE", "22000", ""]) {
+      expect(parseServiceOtp("go", body, { sender })).toEqual({
+        status: "matched", otp: "491052",
+      });
+    }
+    for (const sender of ["Telegram", "WhatsApp", "Instagram", "Gojek-Info"]) {
+      expect(parseServiceOtp("go", body, { sender })).toEqual({
+        status: "rejected", reason: "foreign_sender",
+      });
+    }
+  });
+
+  it("does not let another service's OTP satisfy go, and guards ambiguity and decoys", () => {
+    expect(parseServiceOtp("go", "Kode WhatsApp Anda: 482901")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("go", "Telegram code 51284")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("go", "G-491052 is your Google code, or use 731904")).toEqual({
+      status: "rejected", reason: "ambiguous_candidates",
+    });
+    expect(parseServiceOtp("go", "Google verification phone 123456")).toEqual({
+      status: "rejected", reason: "decoy_candidate",
+    });
+  });
+
+  it("keeps the WhatsApp brand word out of the other services' keyword lists", () => {
+    // Each service's keywords are only its own brand word, so one body can never
+    // satisfy two services at once.
+    expect(parseServiceOtp("wa", "Telegram code 51284")).toEqual({
+      status: "rejected", reason: "missing_keyword",
+    });
+    expect(parseServiceOtp("wa", "682019 is your Instagram code. Don't share it")).toEqual({
+      status: "rejected", reason: "missing_keyword",
     });
   });
 });
