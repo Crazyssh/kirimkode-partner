@@ -8,6 +8,7 @@ import {
   assertUniqueActiveNumber,
   assertDeviceOperationAllowed,
   calculateAuthoritativePricing,
+  describeDimensionOverrides,
   effectiveDeviceStatus,
   isDeviceLive,
   normalizeIndonesianNumber,
@@ -19,9 +20,11 @@ import {
   resolveServedCatalog,
   resolveServedDimension,
   selectEligibleInventory,
+  validateDimensionDeclaration,
   validateOffer,
   validatePricingConfig,
   type CatalogDimension,
+  type DimensionDeclarationInput,
   type DeviceState,
   type ExistingNumberIdentity,
   type InventoryCandidate,
@@ -486,5 +489,247 @@ describe("offer validation and deterministic inventory selection", () => {
       NOW,
     );
     expect(selected).toBeNull();
+  });
+});
+
+/**
+ * Validation for the admin declare path.
+ *
+ * Declaring a dimension used to mean running raw `INSERT` SQL against the live
+ * database. These rules are the pure half of the admin command that replaces it:
+ * every rejection here mirrors something `catalog_dimensions` would refuse
+ * anyway — the VARCHAR(32)/CHAR(2) widths, `catalog_dimensions_code_check`, and
+ * the per-column bounds of `catalog_dimensions_pricing_check` — so an operator
+ * gets a named field and a stable code instead of a constraint crash.
+ *
+ * **Validates: Requirements 16.5, 19.1**
+ */
+describe("catalog dimension declaration validation", () => {
+  const VALID: DimensionDeclarationInput = {
+    serviceCode: "tg",
+    countryCode: "ID",
+    operatorCode: "any",
+    enabled: true,
+  };
+
+  /** The violation codes for one input, so a case can assert exactly what failed. */
+  function codesFor(input: DimensionDeclarationInput): readonly string[] {
+    const result = validateDimensionDeclaration(input);
+    return result.valid ? [] : result.violations.map((violation) => violation.code);
+  }
+
+  it("accepts a minimal dimension and normalises it to the stored row", () => {
+    const result = validateDimensionDeclaration(VALID);
+    expect(result.valid).toBe(true);
+    if (!result.valid) throw new Error("expected a valid declaration");
+    // Every unset override becomes an explicit null: "inherit the global config".
+    expect(result.declaration).toEqual({
+      serviceCode: "tg",
+      countryCode: "ID",
+      operatorCode: "any",
+      enabled: true,
+      minBasePriceIdr: null,
+      maxBasePriceIdr: null,
+      fixedFeeIdr: null,
+      markupBps: null,
+      roundToIdr: null,
+      note: null,
+    });
+    // Frozen, as every returned literal in this module is.
+    expect(Object.isFrozen(result.declaration)).toBe(true);
+  });
+
+  it("trims whitespace and upper-cases the country code", () => {
+    const result = validateDimensionDeclaration({
+      ...VALID,
+      serviceCode: "  tg  ",
+      // `id` and `ID` are unambiguously the same country, and the CHECK stores
+      // the upper form, so this is normalised rather than refused.
+      countryCode: " id ",
+      operatorCode: " any ",
+      note: "  permintaan klien  ",
+    });
+    expect(result.valid).toBe(true);
+    if (!result.valid) throw new Error("expected a valid declaration");
+    expect(result.declaration.serviceCode).toBe("tg");
+    expect(result.declaration.countryCode).toBe("ID");
+    expect(result.declaration.operatorCode).toBe("any");
+    expect(result.declaration.note).toBe("permintaan klien");
+  });
+
+  it("keeps a withheld dimension withheld", () => {
+    const result = validateDimensionDeclaration({ ...VALID, enabled: false });
+    expect(result.valid).toBe(true);
+    if (!result.valid) throw new Error("expected a valid declaration");
+    expect(result.declaration.enabled).toBe(false);
+  });
+
+  it("rejects an empty, over-long, or malformed service code", () => {
+    expect(codesFor({ ...VALID, serviceCode: "" })).toEqual(["INVALID_SERVICE_CODE"]);
+    expect(codesFor({ ...VALID, serviceCode: "   " })).toEqual(["INVALID_SERVICE_CODE"]);
+    // VARCHAR(32): 32 fits, 33 does not.
+    expect(codesFor({ ...VALID, serviceCode: "a".repeat(32) })).toEqual([]);
+    expect(codesFor({ ...VALID, serviceCode: "a".repeat(33) })).toEqual(["INVALID_SERVICE_CODE"]);
+    // A code is a machine identifier that reaches URLs, quote filters, and order
+    // snapshots, so mixed case and inner whitespace are refused rather than
+    // normalised — two codes that look identical would be a real hazard.
+    expect(codesFor({ ...VALID, serviceCode: "WA" })).toEqual(["INVALID_SERVICE_CODE"]);
+    expect(codesFor({ ...VALID, serviceCode: "wa tg" })).toEqual(["INVALID_SERVICE_CODE"]);
+    expect(codesFor({ ...VALID, serviceCode: "-wa" })).toEqual(["INVALID_SERVICE_CODE"]);
+    // `_` and `-` inside a code are fine; they already appear in operator codes.
+    expect(codesFor({ ...VALID, serviceCode: "wa_biz-2" })).toEqual([]);
+  });
+
+  it("rejects a country code that is not ISO-2", () => {
+    expect(codesFor({ ...VALID, countryCode: "IDN" })).toEqual(["INVALID_COUNTRY_CODE"]);
+    expect(codesFor({ ...VALID, countryCode: "I" })).toEqual(["INVALID_COUNTRY_CODE"]);
+    expect(codesFor({ ...VALID, countryCode: "" })).toEqual(["INVALID_COUNTRY_CODE"]);
+    expect(codesFor({ ...VALID, countryCode: "1D" })).toEqual(["INVALID_COUNTRY_CODE"]);
+  });
+
+  it("rejects an empty or malformed operator code", () => {
+    expect(codesFor({ ...VALID, operatorCode: "" })).toEqual(["INVALID_OPERATOR_CODE"]);
+    expect(codesFor({ ...VALID, operatorCode: "ANY" })).toEqual(["INVALID_OPERATOR_CODE"]);
+    expect(codesFor({ ...VALID, operatorCode: "a".repeat(33) })).toEqual(["INVALID_OPERATOR_CODE"]);
+  });
+
+  it("collects every violation instead of stopping at the first", () => {
+    expect(codesFor({ serviceCode: "", countryCode: "XYZ", operatorCode: "", enabled: true })).toEqual([
+      "INVALID_SERVICE_CODE",
+      "INVALID_COUNTRY_CODE",
+      "INVALID_OPERATOR_CODE",
+    ]);
+  });
+
+  // These bounds are exactly `catalog_dimensions_pricing_check`, which in turn
+  // mirrors the global `platform_configs_policy_check`.
+  it("accepts the price-override guardrail boundaries", () => {
+    // Zero is a valid fee/markup/guardrail; `roundToIdr` is a divisor in the
+    // pricing formula, so its floor is 1 rather than 0.
+    expect(
+      codesFor({
+        ...VALID,
+        minBasePriceIdr: 0,
+        maxBasePriceIdr: 0,
+        fixedFeeIdr: 0,
+        markupBps: 0,
+        roundToIdr: 1,
+      }),
+    ).toEqual([]);
+  });
+
+  it("rejects a negative, fractional, or non-finite price override", () => {
+    expect(codesFor({ ...VALID, fixedFeeIdr: -1 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, markupBps: -1 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, minBasePriceIdr: -1 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, roundToIdr: 0 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, roundToIdr: -50 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, fixedFeeIdr: 12.5 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, fixedFeeIdr: Number.NaN })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, fixedFeeIdr: Number.POSITIVE_INFINITY })).toEqual([
+      "INVALID_PRICE_OVERRIDE",
+    ]);
+    expect(codesFor({ ...VALID, fixedFeeIdr: Number.MAX_SAFE_INTEGER + 2 })).toEqual([
+      "INVALID_PRICE_OVERRIDE",
+    ]);
+  });
+
+  // The columns are INTEGER, so anything past int4 cannot be stored even though
+  // it satisfies every CHECK expression. The driver rejects the parameter before
+  // the statement runs and Prisma reports a codeless
+  // `PrismaClientUnknownRequestError`, which the admin action can only render as
+  // a 500 — so the bound has to be caught here, as a named field violation.
+  it("rejects an override past the INTEGER column limit", () => {
+    const int4Max = 2_147_483_647;
+    expect(codesFor({ ...VALID, fixedFeeIdr: int4Max })).toEqual([]);
+    expect(codesFor({ ...VALID, fixedFeeIdr: int4Max + 1 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, markupBps: 3_000_000_000 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    expect(codesFor({ ...VALID, roundToIdr: int4Max + 1 })).toEqual(["INVALID_PRICE_OVERRIDE"]);
+    // Both guardrail bounds at the ceiling stay a valid, correctly-ordered pair.
+    expect(codesFor({ ...VALID, minBasePriceIdr: int4Max, maxBasePriceIdr: int4Max })).toEqual([]);
+  });
+
+  it("treats null and undefined overrides alike as inherit-the-global", () => {
+    const nulled = validateDimensionDeclaration({
+      ...VALID,
+      minBasePriceIdr: null,
+      maxBasePriceIdr: undefined,
+      fixedFeeIdr: null,
+      markupBps: undefined,
+      roundToIdr: null,
+    });
+    expect(nulled.valid).toBe(true);
+    if (!nulled.valid) throw new Error("expected a valid declaration");
+    expect(nulled.declaration.minBasePriceIdr).toBeNull();
+    expect(nulled.declaration.maxBasePriceIdr).toBeNull();
+    expect(nulled.declaration.markupBps).toBeNull();
+  });
+
+  it("rejects an inverted guardrail only when BOTH bounds are overridden", () => {
+    expect(codesFor({ ...VALID, minBasePriceIdr: 5_000, maxBasePriceIdr: 1_000 })).toEqual([
+      "INVALID_PRICE_GUARDRAIL_ORDER",
+    ]);
+    // Equal bounds are a valid single-price dimension.
+    expect(codesFor({ ...VALID, minBasePriceIdr: 1_000, maxBasePriceIdr: 1_000 })).toEqual([]);
+    // A half-override inherits the other bound from the global config, which is
+    // already internally consistent, so there is nothing to compare.
+    expect(codesFor({ ...VALID, minBasePriceIdr: 5_000 })).toEqual([]);
+    expect(codesFor({ ...VALID, maxBasePriceIdr: 100 })).toEqual([]);
+  });
+
+  it("rejects a note longer than the column", () => {
+    // VARCHAR(500): 500 fits, 501 does not.
+    expect(codesFor({ ...VALID, note: "n".repeat(500) })).toEqual([]);
+    expect(codesFor({ ...VALID, note: "n".repeat(501) })).toEqual(["INVALID_NOTE"]);
+  });
+
+  it("normalises a blank note to null rather than an empty string", () => {
+    const result = validateDimensionDeclaration({ ...VALID, note: "   " });
+    expect(result.valid).toBe(true);
+    if (!result.valid) throw new Error("expected a valid declaration");
+    expect(result.declaration.note).toBeNull();
+  });
+});
+
+/**
+ * The read view's override/inherited summary, so an operator can see what a
+ * dimension actually charges without re-deriving the `?? config` fallback.
+ *
+ * **Validates: Requirements 16.5**
+ */
+describe("describeDimensionOverrides", () => {
+  it("reports every pricing input as inherited when none is overridden", () => {
+    expect(describeDimensionOverrides(MVP_CATALOG_DIMENSION)).toEqual({
+      minBasePriceIdr: false,
+      maxBasePriceIdr: false,
+      fixedFeeIdr: false,
+      markupBps: false,
+      roundToIdr: false,
+    });
+  });
+
+  it("distinguishes an overridden input from an inherited one", () => {
+    const described = describeDimensionOverrides({
+      ...MVP_CATALOG_DIMENSION,
+      fixedFeeIdr: 500,
+      markupBps: 3_000,
+      // An explicit null is an inherit, exactly like an absent field.
+      roundToIdr: null,
+    });
+    expect(described).toEqual({
+      minBasePriceIdr: false,
+      maxBasePriceIdr: false,
+      fixedFeeIdr: true,
+      markupBps: true,
+      roundToIdr: false,
+    });
+    expect(Object.isFrozen(described)).toBe(true);
+  });
+
+  it("treats a zero override as overridden, not inherited", () => {
+    // Zero is a meaningful fee: "this dimension charges no fixed fee", which is
+    // NOT the same as inheriting the global fee.
+    const described = describeDimensionOverrides({ ...MVP_CATALOG_DIMENSION, fixedFeeIdr: 0 });
+    expect(described.fixedFeeIdr).toBe(true);
   });
 });

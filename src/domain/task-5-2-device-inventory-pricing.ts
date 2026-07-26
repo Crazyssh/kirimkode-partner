@@ -547,6 +547,220 @@ export function configDimension(config: PricingConfig): CatalogDimension {
   });
 }
 
+/**
+ * Why a proposed catalog dimension was refused.
+ *
+ * Every code corresponds to something the database would refuse anyway — the
+ * column widths, `catalog_dimensions_code_check`, and
+ * `catalog_dimensions_pricing_check` — so the rejection is a deterministic,
+ * reportable outcome instead of a constraint crash surfacing as a 500.
+ */
+export type DimensionDeclarationViolationCode =
+  | "INVALID_SERVICE_CODE"
+  | "INVALID_COUNTRY_CODE"
+  | "INVALID_OPERATOR_CODE"
+  | "INVALID_PRICE_OVERRIDE"
+  | "INVALID_PRICE_GUARDRAIL_ORDER"
+  | "INVALID_NOTE";
+
+/** One refusal, naming the offending field so the UI can point at it. */
+export interface DimensionDeclarationViolation {
+  readonly field: string;
+  readonly code: DimensionDeclarationViolationCode;
+}
+
+/**
+ * A dimension an operator proposes to declare, as it arrives from the form.
+ *
+ * The five pricing overrides are optional and nullable: an absent or null
+ * override means "inherit the active platform config", which is what every
+ * currently-live dimension does.
+ */
+export interface DimensionDeclarationInput {
+  readonly serviceCode: string;
+  readonly countryCode: string;
+  readonly operatorCode: string;
+  readonly enabled: boolean;
+  readonly minBasePriceIdr?: number | null;
+  readonly maxBasePriceIdr?: number | null;
+  readonly fixedFeeIdr?: number | null;
+  readonly markupBps?: number | null;
+  readonly roundToIdr?: number | null;
+  readonly note?: string | null;
+}
+
+/** A declaration input normalised to exactly what the row will contain. */
+export interface NormalizedDimensionDeclaration {
+  readonly serviceCode: string;
+  readonly countryCode: string;
+  readonly operatorCode: string;
+  readonly enabled: boolean;
+  readonly minBasePriceIdr: number | null;
+  readonly maxBasePriceIdr: number | null;
+  readonly fixedFeeIdr: number | null;
+  readonly markupBps: number | null;
+  readonly roundToIdr: number | null;
+  readonly note: string | null;
+}
+
+export type DimensionDeclarationValidation =
+  | { readonly valid: true; readonly declaration: NormalizedDimensionDeclaration }
+  | { readonly valid: false; readonly violations: readonly DimensionDeclarationViolation[] };
+
+/** `catalog_dimensions.serviceCode` / `operatorCode` are VARCHAR(32). */
+const DIMENSION_CODE_MAX_LENGTH = 32;
+/** `catalog_dimensions.note` is VARCHAR(500). */
+const DIMENSION_NOTE_MAX_LENGTH = 500;
+/**
+ * A dimension code as the rest of the catalog already writes them: lower-case
+ * alphanumerics plus `_`/`-` (`wa`, `tg`, `ig`, `go`, `any`). Narrower than the
+ * database's `<> ''`, deliberately — a code is a stable machine identifier that
+ * ends up in URLs, quote filters, and order snapshots, so whitespace and
+ * mixed case would produce two dimensions that look identical to an operator.
+ */
+const DIMENSION_CODE_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+/** ISO-2 upper case, matching the `countryCode ~ '^[A-Z]{2}$'` CHECK. */
+const ISO2_COUNTRY_PATTERN = /^[A-Z]{2}$/;
+
+/**
+ * The pricing-override columns, paired with their per-column CHECK bound.
+ *
+ * `roundToIdr` must be strictly positive because it is a divisor in
+ * {@link calculateAuthoritativePricing}; the rest are merely non-negative. This
+ * mirrors `catalog_dimensions_pricing_check` exactly, which in turn mirrors the
+ * global `platform_configs_policy_check`.
+ */
+const PRICE_OVERRIDE_FIELDS = Object.freeze([
+  { field: "minBasePriceIdr", minimum: 0 },
+  { field: "maxBasePriceIdr", minimum: 0 },
+  { field: "fixedFeeIdr", minimum: 0 },
+  { field: "markupBps", minimum: 0 },
+  { field: "roundToIdr", minimum: 1 },
+] as const);
+
+/**
+ * Upper bound for every override: the columns are `INTEGER`, so this is a real
+ * storage limit, not a policy choice.
+ *
+ * `Number.isSafeInteger` alone is not enough. A value between INT4 max and
+ * `MAX_SAFE_INTEGER` passes every CHECK expression yet cannot be encoded as an
+ * int4 parameter at all: the driver fails before the statement runs, and Prisma
+ * surfaces it as `PrismaClientUnknownRequestError` — no error code to branch on,
+ * so it reaches the operator as a 500 instead of the named field violation this
+ * validator exists to produce. Checked against the live database rather than
+ * assumed.
+ */
+const INT4_MAX = 2_147_483_647;
+
+function normalizeOptionalNumber(value: number | null | undefined): number | null {
+  return value === undefined ? null : value;
+}
+
+/**
+ * Validate and normalise a proposed catalog dimension BEFORE it reaches the
+ * database.
+ *
+ * This is the pure half of the admin declare path. It rejects everything the
+ * `catalog_dimensions` constraints would reject — code shape and length, ISO-2
+ * country, the per-column price-override bounds, and `max >= min` — so an
+ * operator gets a named field and a stable code instead of a Postgres
+ * constraint error. It deliberately does NOT check whether the triple already
+ * exists: uniqueness is a fact about stored rows, not about the input, so it
+ * stays with the gateway that holds the unique index.
+ *
+ * Every violation is collected rather than thrown on the first problem, matching
+ * how the config form reports its invariant violations.
+ */
+export function validateDimensionDeclaration(
+  input: DimensionDeclarationInput,
+): DimensionDeclarationValidation {
+  const violations: DimensionDeclarationViolation[] = [];
+
+  const serviceCode = typeof input.serviceCode === "string" ? input.serviceCode.trim() : "";
+  const operatorCode = typeof input.operatorCode === "string" ? input.operatorCode.trim() : "";
+  // Country code is upper-cased rather than rejected for case: `id` and `ID` are
+  // unambiguously the same country, and the CHECK stores the upper form.
+  const countryCode =
+    typeof input.countryCode === "string" ? input.countryCode.trim().toUpperCase() : "";
+
+  if (
+    serviceCode.length === 0 ||
+    serviceCode.length > DIMENSION_CODE_MAX_LENGTH ||
+    !DIMENSION_CODE_PATTERN.test(serviceCode)
+  ) {
+    violations.push({ field: "serviceCode", code: "INVALID_SERVICE_CODE" });
+  }
+  if (!ISO2_COUNTRY_PATTERN.test(countryCode)) {
+    violations.push({ field: "countryCode", code: "INVALID_COUNTRY_CODE" });
+  }
+  if (
+    operatorCode.length === 0 ||
+    operatorCode.length > DIMENSION_CODE_MAX_LENGTH ||
+    !DIMENSION_CODE_PATTERN.test(operatorCode)
+  ) {
+    violations.push({ field: "operatorCode", code: "INVALID_OPERATOR_CODE" });
+  }
+
+  const overrides: Record<string, number | null> = {};
+  for (const { field, minimum } of PRICE_OVERRIDE_FIELDS) {
+    const value = normalizeOptionalNumber(input[field]);
+    overrides[field] = value;
+    if (value === null) continue;
+    if (!Number.isSafeInteger(value) || value < minimum || value > INT4_MAX) {
+      violations.push({ field, code: "INVALID_PRICE_OVERRIDE" });
+    }
+  }
+
+  // Only meaningful when BOTH bounds are overridden; a half-override inherits
+  // the other bound from the global config, which is already consistent.
+  const min = overrides.minBasePriceIdr;
+  const max = overrides.maxBasePriceIdr;
+  if (min !== null && max !== null && Number.isSafeInteger(min) && Number.isSafeInteger(max) && max < min) {
+    violations.push({ field: "maxBasePriceIdr", code: "INVALID_PRICE_GUARDRAIL_ORDER" });
+  }
+
+  const trimmedNote = typeof input.note === "string" ? input.note.trim() : "";
+  if (trimmedNote.length > DIMENSION_NOTE_MAX_LENGTH) {
+    violations.push({ field: "note", code: "INVALID_NOTE" });
+  }
+
+  if (violations.length > 0) {
+    return Object.freeze({ valid: false, violations: Object.freeze(violations) });
+  }
+  return Object.freeze({
+    valid: true,
+    declaration: Object.freeze({
+      serviceCode,
+      countryCode,
+      operatorCode,
+      enabled: input.enabled,
+      minBasePriceIdr: overrides.minBasePriceIdr,
+      maxBasePriceIdr: overrides.maxBasePriceIdr,
+      fixedFeeIdr: overrides.fixedFeeIdr,
+      markupBps: overrides.markupBps,
+      roundToIdr: overrides.roundToIdr,
+      note: trimmedNote.length === 0 ? null : trimmedNote,
+    }),
+  });
+}
+
+/**
+ * Whether each pricing input of a dimension is overridden or inherited.
+ *
+ * Purely derived from the row, so the admin read view can show an operator what
+ * a dimension actually charges without duplicating the `?? config` resolution
+ * that {@link resolveDimensionPricing} owns.
+ */
+export function describeDimensionOverrides(
+  dimension: CatalogDimension,
+): Readonly<Record<string, boolean>> {
+  const described: Record<string, boolean> = {};
+  for (const { field } of PRICE_OVERRIDE_FIELDS) {
+    described[field] = (dimension[field] ?? null) !== null;
+  }
+  return Object.freeze(described);
+}
+
 export interface OfferInput {
   readonly serviceCode: string;
   readonly countryCode: string;

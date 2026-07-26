@@ -23,6 +23,7 @@ export interface AdminNavEntry {
 export const ADMIN_NAV_ITEMS: readonly AdminNavEntry[] = Object.freeze([
   { href: "/admin", label: "Review Partner" },
   { href: "/admin/config", label: "Konfigurasi" },
+  { href: "/admin/catalog", label: "Katalog" },
   { href: "/admin/recovery", label: "Recovery" },
   { href: "/admin/audit", label: "Audit" },
   { href: "/admin/sms-access", label: "Akses SMS" },

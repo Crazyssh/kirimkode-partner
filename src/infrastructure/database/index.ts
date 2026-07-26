@@ -75,6 +75,7 @@ export {
   PrismaAdminResourceMutationGateway,
 } from "./admin-resource-gateway";
 export { PrismaAdminConfigGateway } from "./admin-config-gateway";
+export { PrismaAdminCatalogDimensionGateway } from "./admin-catalog-dimension-gateway";
 export { PrismaAuditBrowserGateway } from "./admin-audit-gateway";
 export { PrismaRawSmsReadGateway } from "./admin-raw-sms-gateway";
 export { PrismaOneTimeTokenGateway } from "./one-time-token-repository";

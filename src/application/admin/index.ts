@@ -52,6 +52,21 @@ export type {
   PublishConfigVersionInput,
 } from "./config-ports";
 export {
+  AdminCatalogDimensionService,
+  type AdminCatalogDimensionServiceDeps,
+  type AdminCatalogDimensionView,
+  type DeclareDimensionInput,
+  type DeclareDimensionOutcome,
+  type ToggleDimensionInput,
+  type ToggleDimensionOutcome,
+} from "./admin-catalog-dimension-service";
+export type {
+  AdminCatalogDimensionGateway,
+  AdminCatalogDimensionRow,
+  DeclareDimensionRecord,
+  ToggleDimensionRecord,
+} from "./catalog-dimension-ports";
+export {
   AdminAuditService,
   type AdminAuditListInput,
   type AdminAuditServiceDeps,

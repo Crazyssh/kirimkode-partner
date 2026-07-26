@@ -13,6 +13,7 @@ import { OperationalQueryService } from "@application/portal";
 import { getOrderServices } from "@application/orders";
 import {
   getPartnerDatabaseClient,
+  PrismaAdminCatalogDimensionGateway,
   PrismaAdminConfigGateway,
   PrismaAdminIdentityGateway,
   PrismaAdminResourceMutationGateway,
@@ -34,6 +35,7 @@ import { createSmsOtpCipher } from "@infrastructure/crypto/sms-otp-cipher";
 import { adminSessionTtlFromSeconds } from "./admin-config";
 import { AdminAuthorizationService } from "./admin-authorization-service";
 import { AdminAuditService } from "./admin-audit-service";
+import { AdminCatalogDimensionService } from "./admin-catalog-dimension-service";
 import { AdminConfigService } from "./admin-config-service";
 import { AdminLoginService } from "./admin-login-service";
 import { AdminLogoutService } from "./admin-logout-service";
@@ -53,6 +55,12 @@ export interface AdminServices {
   readonly resources: AdminResourceService;
   /** PlatformConfig form: validated, versioned updates (task 15.4). */
   readonly config: AdminConfigService;
+  /**
+   * Catalog dimensions: declare a service/country/operator the platform sells,
+   * or withdraw one from sale. Replaces hand-written `INSERT` SQL with an
+   * authorised, audited action (requirement 16.5).
+   */
+  readonly catalogDimensions: AdminCatalogDimensionService;
   /** Paginated redaction-safe audit browser (task 15.4). */
   readonly audit: AdminAuditService;
   /** Admin-initiated order recovery via CAS transition commands (task 15.4). */
@@ -144,6 +152,11 @@ export function getAdminServices(): AdminServices {
       }),
       config: new AdminConfigService({
         gateway: new PrismaAdminConfigGateway(client),
+        clock,
+        idGenerator,
+      }),
+      catalogDimensions: new AdminCatalogDimensionService({
+        gateway: new PrismaAdminCatalogDimensionGateway(client),
         clock,
         idGenerator,
       }),
